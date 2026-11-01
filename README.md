@@ -1,1 +1,96 @@
 # Sensor-Box-Enhanced
+
+ESPHome air quality monitor based on Tom's Sensorbox v2, with extra sensors, a formaldehyde sensor with a
+buzzer alarm, SD card logging and optional screen printouts on a thermal printer. It works on its own and
+connects to Home Assistant through the ESPHome API.
+
+## Based on
+
+- [3D Printer Emission Sensor Array (Sensorbox v2)](https://www.printables.com/model/1079858-3d-printer-emission-sensor-array-sensorbox-v2)
+  by Tom (MadeWithLayers), CC BY: enclosure, main board SBR1 r1.1 (ESP32-S2, 2.8" ILI9341 display) and the
+  ESPHome config r2 ([go.toms3d.org/sbr1](https://go.toms3d.org/sbr1)) that this config started from.
+- [ZE08 CH2O Sensor Mount Base + Buzzer for Sensorbox v2](https://www.printables.com/model/1219568-ze08-ch2o-sensor-mount-base-buzzer-for-sensorbox-v)
+  by Simply Maker, CC BY-NC-SA: mount for the ZE08-CH2O sensor and the buzzer.
+- Addon board v0.2, own design (`hardware/enhanced-addon-v0.2/`).
+
+The print files are on the Printables pages above.
+
+## What's added
+
+Hardware:
+
+- ZE08-CH2O formaldehyde sensor and a buzzer, on the mount above.
+- Addon board v0.2 with an SR602 PIR motion sensor, an LTR390 UV/ambient light sensor and a BME680
+  (temperature, humidity, pressure, gas). The LTR390 and BME680 breakouts share one I²C bus; the board
+  connects to the main board with a 4-pin header (3V3, GND, SCL, SDA) and one wire for the PIR (GPIO39).
+  Pinout: [hardware/enhanced-addon-v0.2/README.md](hardware/enhanced-addon-v0.2/README.md).
+
+![Addon board v0.2](hardware/enhanced-addon-v0.2/Addon%20Board%20v0.2.png)
+
+Software (`esphome/airquality.yaml`):
+
+- Eight display pages: current values, an info page with the alarm limits, 1 h and 24 h graphs (air quality,
+  climate, system) and a QR code that opens the web UI. A short press on the top button shows the next page.
+- Buzzer alarm with limits for CO2, CH2O, TVOC and particulate matter, set in the web UI.
+- The display backlight follows presence (PIR) and ambient light, with three levels set in the web UI.
+- Indoor air quality index from the BME680 (Bosch BSEC2).
+- Logging to an SD card in the display module's card slot (wired to GPIO35–38): one CSV row per minute, one
+  file per day.
+- Optional screen print on a thermal printer, see below.
+
+## Sensors
+
+| Sensor | Measures | Interface |
+| --- | --- | --- |
+| SCD40 | CO2, temperature, humidity | I²C |
+| SHT41 | Temperature, humidity | I²C |
+| SGP30 | TVOC, eCO2 | I²C |
+| ENS160 + AHT21 | TVOC, eCO2, air quality index; temperature, humidity | I²C |
+| BME680 | Temperature, humidity, pressure, gas (IAQ via BSEC2) | I²C |
+| LTR390 | Ambient light, UV index | I²C |
+| ZE08-CH2O | Formaldehyde | UART |
+| PMSx003 | PM1, PM2.5, PM10 | UART |
+| SR602 | Motion | GPIO |
+
+The config also supports an SGP41 (VOC and NOx index), which isn't fitted yet. Which sensor feeds which
+value: [docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
+
+## Thermal printer (optional)
+
+Hold the top button for 5 s, or press "Print Screen" in the web UI, to print the current page on a 58 mm
+QR204 thermal printer. The box sends the page over WiFi as ESC/POS (raw TCP, port 9100) to an ESP32-C3 that
+is wired to the printer; this bridge is a separate project,
+[QR204-Printer-Bridge](https://github.com/Ajimaru/QR204-Printer-Bridge). The printer's address
+("Printer Host", default `thermal-printer.local`) and the print settings are in the web UI. Without a printer
+everything else works as usual.
+
+## Repository
+
+| Path | Contents |
+| --- | --- |
+| `esphome/airquality.yaml` | The ESPHome config |
+| `esphome/sd_logger.h`, `esphome/thermal_print.h` | SD card logging and screen printing, included by the config |
+| `esphome/secrets.example.yaml` | Template for `secrets.yaml` |
+| `hardware/enhanced-addon-v0.2/` | Addon board v0.2: Gerber and drill files (EasyEDA Pro export, `AddonBoard v0.2.zip` for ordering), a render and the pinout |
+| `docs/` | Sensor capability matrix |
+
+## Setup
+
+1. Copy `esphome/secrets.example.yaml` to `secrets.yaml` and fill it in (WiFi, web UI login, API key).
+2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h` and `secrets.yaml` in the same folder of your
+   ESPHome setup, for example the ESPHome Device Builder in Home Assistant.
+3. In `airquality.yaml`, adjust the time zone under `time:`. The device gets its address by DHCP; for a fixed
+   address add a `manual_ip:` block under `wifi:` (or a DHCP reservation in your router).
+4. Flash over USB the first time, then over the air. The settings (alarm limits, backlight, printer) are in
+   the web UI at the device's address; the login is the one from `secrets.yaml`.
+
+Tested with ESPHome 2026.9.
+
+## License
+
+[CC BY 4.0](LICENSE), in line with the CC BY license of Tom's Sensorbox v2, which this project builds on.
+`esphome/airquality.yaml` is a modified version of Tom's ESPHome config r2. The ZE08 mount by Simply Maker is
+not part of this repository and keeps its own license (CC BY-NC-SA).
+
+When you reuse this project, credit it as: "Sensor-Box-Enhanced by Ajimaru, based on Sensorbox v2 by Tom
+(MadeWithLayers)".

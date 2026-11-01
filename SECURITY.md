@@ -1,14 +1,21 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+There are no releases. Only the current state of the `main` branch is maintained.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please don't open a public issue. Report it privately through GitHub instead: **Security** tab →
+**Report a vulnerability**. Reports are answered as time allows; this is a hobby project.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+## Notes for users
+
+The device is meant for a trusted home network:
+
+- `secrets.yaml` holds the WiFi password, the web UI login and the API encryption key. Never commit it
+  (it's git-ignored here).
+- Don't expose the web UI, the ESPHome API or OTA updates to the internet.
+- OTA updates have no password in this config. If other people use your network, add
+  `password: !secret ota_password` under `ota:`.
+- The web UI uses digest authentication over plain HTTP; the ESPHome API is encrypted.

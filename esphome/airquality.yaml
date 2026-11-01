@@ -1,0 +1,2519 @@
+# Based on:
+# Sensorbox v2 config for PCB SBR1
+# config r2 (20241130)
+# https://go.toms3d.org/sbr1
+
+substitutions:
+  name: airquality
+  friendly_name: Airquality
+  # QR204 thermal printer bridge (separate project): raw ESC/POS over TCP. The host is set in the web UI
+  # ("Printer Host", text entity printer_host).
+  printer_port: "9100"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.1
+  name_add_mac_suffix: false
+  project:
+    name: AirQuality.Sensor
+    version: dev
+  # SD card logging helper; must sit next to this YAML on the HA host.
+  includes:
+    - sd_logger.h
+    # Screen printing on the QR204 thermal printer; must sit next to this YAML on the HA host.
+    - thermal_print.h
+  on_boot:
+    # SD card (display module J4) on its own SPI bus (SPI3): CLK GPIO35, MOSI GPIO37, MISO GPIO36, CS GPIO38.
+    # begin() only starts the sdlog task, which sets up the bus and mounts the card; returns immediately.
+    - priority: 700
+      then:
+        - lambda: sdlog::begin(35, 37, 36, 38);
+    # Below 600: mipi_spi sets up at DATA (600) and allocates its buffer there; drawing earlier crashes.
+    - priority: 590
+      then:
+        - lambda: |-
+            id(display_main).fill(Color::BLACK);
+            id(display_main).update();
+        # "Backlight Presence" level for the first 30 s (see the script).
+        - script.execute: adjust_backlight_based_on_light
+    - priority: 550
+      then:
+        - delay: 30s
+        - script.execute: adjust_backlight_based_on_light
+
+esp32:
+  board: esp32-s2-saola-1
+  framework:
+    type: arduino
+    advanced:
+      # SD card logging (sd_logger.h): ESPHome excludes these ESP-IDF components by default.
+      include_builtin_idf_components: [fatfs, sdmmc, esp_driver_sdmmc, esp_driver_sdspi, wear_levelling]
+      disable_vfs_support_dir: false
+
+psram:
+
+# Logging
+logger:
+  level: DEBUG
+
+# Home Assistant API and failsafe mechanisms
+api:
+  # Keep running without an API client (HA outage); the box works standalone and every reboot restarts the ENS160.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_encryption_key
+      
+# Over-The-Air updates
+ota:
+  - platform: esphome
+
+# provisioning Wi-Fi via serial
+improv_serial:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  #reboot_timeout: 15min
+  ap:
+    ssid: ${name}
+    password: !secret wifi_password
+
+captive_portal:
+
+# Externe Komponenten
+dashboard_import:
+  package_import_url: github://esphome/firmware/esphome-web/esp32s2.yaml@main
+  import_full_config: true
+
+# Webswerver
+web_server:
+  port: 80
+  version: 3
+  auth:
+    type: digest
+    username: !secret web_server_username
+    password: !secret web_server_password
+  # Own section at the top for the SD card entities (otherwise split into "Configuration"/"Diagnostic").
+  sorting_groups:
+    - id: web_group_sd_card
+      name: "SD Card"
+      sorting_weight: -10
+    - id: web_group_printer
+      name: "Printer"
+      sorting_weight: -9
+    - id: web_group_backlight
+      name: "Display Backlight"
+      sorting_weight: -8
+
+# Debug
+debug:
+  update_interval: 5s
+
+text_sensor:
+  # Last screen print (thermal_print.h); published by the 500 ms interval when it changes.
+  - platform: template
+    name: "Printer Status"
+    id: printer_status
+    icon: "mdi:printer-pos"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 2
+
+  - platform: template
+    name: "SD Card Status"
+    icon: "mdi:sd"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_sd_card
+      sorting_weight: 1
+    update_interval: 30s
+    lambda: |-
+      return {sdlog::get_status()};
+
+  - platform: debug
+    device:
+      name: "Device Info"
+    reset_reason:
+      name: "Reset Reason"
+
+  - platform: template
+    name: "BME680 IAQ Classification"
+    icon: "mdi:checkbox-marked-circle-outline"
+    lambda: |-
+      // Bosch BSEC IAQ index 0-500.
+      if (!id(iaq_bme680).has_state() || isnan(id(iaq_bme680).state)) {
+        return {"unknown"};
+      }
+      int iaq = (int) id(iaq_bme680).state;
+      if (iaq <= 50) {
+        return {"Excellent"};
+      }
+      else if (iaq <= 100) {
+        return {"Good"};
+      }
+      else if (iaq <= 150) {
+        return {"Lightly polluted"};
+      }
+      else if (iaq <= 200) {
+        return {"Moderately polluted"};
+      }
+      else if (iaq <= 250) {
+        return {"Heavily polluted"};
+      }
+      else if (iaq <= 350) {
+        return {"Severely polluted"};
+      }
+      else if (iaq <= 500) {
+        return {"Extremely polluted"};
+      }
+      else {
+        return {"unknown"};
+      }
+
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bme680_bsec
+    iaq_accuracy:
+      name: "BME680 IAQ Accuracy"
+      id: iaq_accuracy_bme680
+      icon: "mdi:check-decagram-outline"
+
+  - platform: template
+    name: "ENS160 Status"
+    icon: "mdi:timer-sand"
+    lambda: |-
+      if (id(ens160_chip).is_failed()) {
+        return {"Not responding"};
+      }
+      // Set on failed reads or invalid output, cleared after the next successful read.
+      if (id(ens160_chip).status_has_warning()) {
+        return {"Read error"};
+      }
+      if (id(eco2_ens160).has_state()) {
+        return {"Ready"};
+      }
+      float warmup = id(ens160_warmup_remaining).state;
+      int remaining = isnan(warmup) ? 60 : (int) warmup;
+      if (remaining > 0) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Warming up (up to %d min)", remaining);
+        return {std::string(buf)};
+      }
+      return {"No data"};
+
+# QR Code generator
+qr_code:
+  - id: webserver_qr
+    value: ""
+    ecc: MEDIUM
+
+# Global Variables
+globals:
+  - id: main_display_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: display_mode_toggle
+    type: int
+    initial_value: '0'
+    restore_value: no 
+  - id: last_bottom_toggle_time
+    type: uint32_t
+    initial_value: '0'
+    restore_value: no
+  - id: top_display_mode_toggle
+    type: int
+    initial_value: '0'
+    restore_value: no 
+  - id: last_top_toggle_time
+    type: uint32_t
+    initial_value: '0'
+    restore_value: no
+  - id: last_button_press_timestamp
+    type: uint32_t
+    initial_value: 'esp_timer_get_time() / 1000000ULL'
+  - id: last_presence_release_timestamp
+    type: uint32_t
+    initial_value: '0'
+  # Ambient-light state for the backlight (dark below 1 lx, bright again from 2 lx).
+  - id: backlight_dark
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: buzzer_alarm_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  # Set by the print_screen script; the next display update also draws the page for the printer.
+  - id: print_requested
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Last thermalprint::state seen by the printer status interval; -1 = publish the current state again
+  # (set after each print start, so a job that finishes within one 500 ms poll is not missed).
+  - id: print_seen_state
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  # Print result box on the screen for 3 s: 0 = none, 1 = "Copy sent", 2 = "Send failed".
+  - id: print_toast
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# Printer bridge address (IP or host name, resolved per print by thermal_print.h); kept across reboots.
+text:
+  - platform: template
+    name: "Printer Host"
+    id: printer_host
+    icon: "mdi:printer-pos"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 1
+    mode: text
+    optimistic: true
+    restore_value: true
+    # The bridge gets its address by DHCP and announces itself via mDNS.
+    initial_value: "thermal-printer.local"
+    min_length: 1
+    max_length: 64
+
+# Screen print size (thermal_print.h): 1x is shorter and prints in ~13 s, 1.5x is easier to read (~24 s).
+select:
+  - platform: template
+    name: "Print Size"
+    id: print_size
+    icon: "mdi:resize"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 4
+    options:
+      - "1x (30 x 40 mm)"
+      - "1.5x (45 x 60 mm)"
+    initial_option: "1.5x (45 x 60 mm)"
+    optimistic: true
+    restore_value: true
+
+# Buzzer Alarm, Temperatur and Humidity Offset per Sensor
+number:
+  # Screen print (thermal_print.h): which colors print black, and the paper feed after the image.
+  - platform: template
+    name: "Print Ink Threshold"
+    id: print_ink_threshold
+    icon: "mdi:contrast-box"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 6
+    # A pixel prints black when its brightest color channel reaches this value (0-255); lower = bolder text.
+    min_value: 16
+    max_value: 240
+    step: 8
+    mode: BOX
+    optimistic: true
+    restore_value: true
+    initial_value: 64
+  - platform: template
+    name: "Print Feed Lines"
+    id: print_feed_lines
+    icon: "mdi:arrow-expand-down"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 7
+    # Lines fed after the image (plus one line feed), so its end clears the printer's tear bar.
+    min_value: 0
+    max_value: 20
+    step: 1
+    mode: BOX
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+  # Display backlight levels, applied by the script adjust_backlight_based_on_light: "Presence" during boot,
+  # while presence is detected and for 15 s after a button press or the end of presence; otherwise "Dark"
+  # or "Bright" by the LTR390 (dark below 1 lx, bright again from 2 lx). 0 % switches the backlight off.
+  - platform: template
+    name: "Backlight Presence"
+    id: backlight_presence_level
+    icon: "mdi:account-eye"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_backlight
+      sorting_weight: 2
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    mode: SLIDER
+    optimistic: true
+    restore_value: true
+    initial_value: 75
+    on_value:
+      - script.execute: adjust_backlight_based_on_light
+  - platform: template
+    name: "Backlight Bright (no presence)"
+    id: backlight_bright_level
+    icon: "mdi:weather-sunny"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_backlight
+      sorting_weight: 3
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    mode: SLIDER
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    on_value:
+      - script.execute: adjust_backlight_based_on_light
+  - platform: template
+    name: "Backlight Dark (no presence)"
+    id: backlight_dark_level
+    icon: "mdi:weather-night"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_backlight
+      sorting_weight: 4
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    mode: SLIDER
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    on_value:
+      - script.execute: adjust_backlight_based_on_light
+
+  - platform: template
+    name: "Manual Sea Level Pressure"
+    id: manual_sea_level_pressure
+    entity_category: config
+    unit_of_measurement: "hPa"
+    icon: "mdi:gauge"
+    initial_value: 1014
+    min_value: 950.0
+    max_value: 1050.0
+    step: 0.1
+    mode: BOX
+    optimistic: true    
+    restore_value: true
+
+  # Buzzer Alarm Treshholds
+  - platform: template
+    name: "CO2 Alarm Threshold"
+    id: co2_alarm_threshold
+    entity_category: config
+    unit_of_measurement: "ppm"
+    icon: "mdi:molecule-co2"
+    initial_value: 1500
+    min_value: 0
+    max_value: 3000
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "CH2O Alarm Threshold"
+    id: ch2o_alarm_threshold
+    entity_category: config
+    icon: "mdi:gas-cylinder"
+    unit_of_measurement: "ppb"
+    initial_value: 200
+    min_value: 0
+    max_value: 1000
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "TVOC Alarm Threshold (ENS160)"
+    id: tvoc_alarm_threshold_ens
+    entity_category: config
+    icon: "mdi:radiator"
+    unit_of_measurement: "ppb"
+    initial_value: 1400
+    min_value: 0
+    max_value: 3000
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "TVOC Alarm Threshold (SGP30)"
+    id: tvoc_alarm_threshold_sgp30
+    entity_category: config
+    icon: "mdi:radiator"
+    unit_of_measurement: "ppb"
+    initial_value: 1000
+    min_value: 0
+    max_value: 3000
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "PM1 Alarm Threshold"
+    id: pm1_alarm_threshold
+    entity_category: config
+    unit_of_measurement: "µg/m³"
+    initial_value: 15
+    min_value: 0
+    max_value: 50
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "PM2.5 Alarm Threshold"
+    id: pm25_alarm_threshold
+    entity_category: config
+    unit_of_measurement: "µg/m³"
+    initial_value: 15
+    min_value: 0
+    max_value: 50
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  - platform: template
+    name: "PM10 Alarm Threshold"
+    id: pm10_alarm_threshold
+    entity_category: config
+    unit_of_measurement: "µg/m³"
+    initial_value: 30
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
+  # --- Temperatur-Offsets ---
+  - platform: template
+    name: "SHT40 Temperature Offset"
+    id: temp_sht40_offset
+    icon: "mdi:thermometer-plus"
+    entity_category: config
+    unit_of_measurement: "°C"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0    
+
+  - platform: template
+    name: "SCD40 Temperature Offset"
+    id: temp_scd40_offset
+    icon: "mdi:thermometer-plus"
+    entity_category: config
+    unit_of_measurement: "°C"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  - platform: template
+    name: "AHT20 ENS160 Temperature Offset"
+    id: temp_aht20_ens_offset
+    icon: "mdi:thermometer-plus"
+    entity_category: config
+    unit_of_measurement: "°C"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  - platform: template
+    name: "BME680 Temperature Offset"
+    id: temp_bme680_offset
+    icon: "mdi:thermometer-plus"
+    entity_category: config
+    unit_of_measurement: "°C"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  # --- Humidity-Offsets ---
+  - platform: template
+    name: "SHT40 Humidity Offset"
+    id: hum_sht40_offset
+    icon: "mdi:water-percent-alert"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  - platform: template
+    name: "SCD40 Humidity Offset"
+    id: hum_scd40_offset
+    icon: "mdi:water-percent-alert"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  - platform: template
+    name: "AHT20 ENS160 Humidity Offset"
+    id: hum_aht20_ens_offset
+    icon: "mdi:water-percent-alert"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  - platform: template
+    name: "BME680 Humidity Offset"
+    id: hum_bme680_offset
+    icon: "mdi:water-percent-alert"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: -20.0
+    max_value: 20.0
+    step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+
+# Stuff
+output:
+  - platform: ledc
+    pin: GPIO15
+    id: backlight_pwm
+
+  - platform: ledc
+    pin: GPIO40
+    id: buzzer_output
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    icon: "mdi:lightbulb-multiple-outline"
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: web_group_backlight
+      sorting_weight: 1
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: top_btn
+    filters:
+      - delayed_on: 10ms
+      # Was 300ms; the page now changes on release, so this delay adds directly to the page change.
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: id(last_button_press_timestamp) = esp_timer_get_time() / 1000000ULL;
+        - script.execute: adjust_backlight_based_on_light
+        - delay: 15s
+        - script.execute: adjust_backlight_based_on_light
+    # Short press: next page. On release, so holding the button to print keeps the current page.
+    on_click:
+      min_length: 10ms
+      max_length: 1s
+      then:
+        - lambda: |-
+            int current_mode = id(main_display_mode);
+            int next_mode;
+            if (current_mode == 0) {
+              next_mode = 3;
+            } else if (current_mode == 3) {
+              next_mode = 6;
+            } else if (current_mode == 6) {
+              next_mode = 1;
+            } else if (current_mode == 1) {
+              next_mode = 2;
+            } else if (current_mode == 2) {
+              next_mode = 4;
+            } else if (current_mode == 4) {
+              next_mode = 5;
+            } else if (current_mode == 5) {
+              next_mode = 7;
+            } else if (current_mode == 7) {
+              next_mode = 0;
+            } else {
+              next_mode = 0;
+            }
+            id(main_display_mode) = next_mode;
+            // Redraw via the display's own scheduler slot so the ~250 ms draw counts against the
+            // display's blocking threshold instead of logging "a scheduled task" on every press.
+            App.scheduler.set_timeout(id(display_main), "page_change", 0, []() { id(display_main).update(); });
+    # Hold 5 s: print the current page. Fires while the button is still held.
+    on_multi_click:
+      - timing:
+          - ON for at least 5s
+        # Default 1s would ignore a hold that starts right after a short press.
+        invalid_cooldown: 0s
+        then:
+          - script.execute: print_screen
+
+  - platform: template
+    name: "High CO2 Alert"
+    id: high_co2_alert
+    icon: "mdi:shield-alert"
+    lambda: |-
+      return id(co2_scd40).state > id(co2_alarm_threshold).state;
+
+  - platform: gpio
+    pin: GPIO39
+    id: presencesensor
+    icon: "mdi:motion-sensor"
+    name: "Presence Sensor"
+    device_class: motion
+    filters:
+      - delayed_off: 100ms
+
+    on_press:
+      then:
+        - script.execute: adjust_backlight_based_on_light
+
+    on_release:
+      then:
+        - lambda: id(last_presence_release_timestamp) = esp_timer_get_time() / 1000000ULL;
+        - delay: 15s
+        - script.execute: adjust_backlight_based_on_light
+
+# Fonts
+font:
+  - file: "gfonts://Rubik@300"
+    id: font_label_14
+    size: 14
+    bpp: 4
+    glyphs: [
+      "0","1","2","3","4","5","6","7","8","9",
+      "µ","³","/","°","%",",",".","(",")","-","_",">",
+      "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+      " ","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
+      ":"
+    ]
+
+  - file: "gfonts://Rubik@400"
+    id: font_value_30
+    size: 30
+    bpp: 4
+    glyphs: [
+      "0","1","2","3","4","5","6","7","8","9",".",":","-"," ",
+      "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
+      "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+      "µ","³","/","°","%"
+    ]
+
+  - file: "gfonts://Orbitron"
+    id: font_heading_36
+    size: 36
+    bpp: 4
+    glyphs: [
+      " ","0","1","2","3","4","5","6","7","8","9",".",":","-",
+      "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+      "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z"
+    ]
+
+  - file: "gfonts://Rubik@300"
+    id: font_label_18
+    size: 18
+    bpp: 4
+    glyphs: [
+      "0","1","2","3","4","5","6","7","8","9",
+      "µ","³","/","°","%",",",".","(",")","-","_",">",
+      "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+      " ","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
+      ":"
+    ]
+
+# Colors
+color:
+  - id: white
+    hex: FFFFFF
+  - id: grey
+    hex: AAAAAA
+  - id: light_grey
+    hex: CCCCCC
+  - id: yellow
+    hex: FFFA72
+  - id: orange
+    hex: FF9C32
+  - id: red
+    hex: FF1616
+  - id: purple
+    hex: FF16e0
+  - id: blue
+    hex: 0000FF
+  - id: green
+    hex: 00FF00
+  - id: magenta
+    hex: FF00FF
+  - id: cyan
+    hex: 00FFFF
+
+# history graph
+# ESPHome uses min_range as the y-axis step: it must divide min_value and max_value evenly
+# and give at most 10 steps, otherwise it logs "reducing y-scale" and stretches the axis.
+# x_grid must give at most 20 divisions per duration ("reducing x-scale").
+graph:
+  # --- 1h graph ---
+  - id: heap_free_graph_1h
+    sensor: heap_free_kb
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: blue
+    min_value: 0
+    max_value: 350
+    min_range: 50
+    line_type: SOLID
+
+  - id: heap_max_block_graph_1h
+    sensor: heap_max_block_kb
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: cyan
+    min_value: 0
+    max_value: 100
+    min_range: 20
+    line_type: SOLID
+
+  - id: free_psram_graph_1h
+    sensor: free_psram_kb
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: magenta
+    min_value: 0
+    max_value: 2000
+    min_range: 250
+    line_type: SOLID
+
+  - id: loop_time_graph_1h
+    sensor: loop_time
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: magenta
+    min_value: 0
+    max_value: 350
+    min_range: 50
+    line_type: SOLID
+
+  - id: temperature_graph
+    sensor: temp_bme680
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: blue
+    min_value: 10
+    max_value: 30
+    min_range: 5
+    line_type: SOLID
+
+  - id: humidity_graph
+    sensor: hum_bme680
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: green
+    min_value: 0
+    max_value: 100
+    min_range: 20
+    line_type: SOLID
+
+  - id: pressure_graph
+    sensor: pres_bme680
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: magenta
+    min_value: 930
+    max_value: 1010
+    min_range: 10
+    line_type: SOLID
+
+  - id: co2_graph
+    sensor: co2_scd40
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: cyan
+    min_value: 400
+    max_value: 2000
+    min_range: 200
+    line_type: SOLID
+
+  - id: voc_graph
+    sensor: tvoc_ens160
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: orange
+    min_value: 0
+    max_value: 600
+    min_range: 100
+    line_type: SOLID
+
+  - id: pm1_graph
+    sensor: pm1_pms
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: orange
+    min_value: 0
+    max_value: 15
+    min_range: 5
+    line_type: SOLID
+
+  - id: pm10_graph
+    sensor: pm10_pms
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: green
+    min_value: 0
+    max_value: 55
+    min_range: 11
+    line_type: SOLID
+
+  - id: pm25_graph
+    sensor: pm25_pms
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: purple
+    min_value: 0
+    max_value: 30
+    min_range: 5
+    line_type: SOLID
+
+  - id: dew_point_graph
+    sensor: dew_point_bme680
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: cyan
+    min_value: 0
+    max_value: 15
+    min_range: 5
+    line_type: SOLID
+
+  - id: light_graph
+    sensor: ambient_light_ltr390
+    duration: 1h
+    x_grid: 5min
+    width: 146
+    height: 51
+    color: yellow
+    min_value: 0
+    max_value: 2000
+    min_range: 500
+    line_type: SOLID
+
+  # --- 24h graph ---
+  - id: temperature_graph_24h
+    sensor: temp_bme680
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: blue
+    min_value: 10
+    max_value: 30
+    min_range: 5
+    line_type: SOLID
+
+  - id: humidity_graph_24h
+    sensor: hum_bme680
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: green
+    min_value: 0
+    max_value: 100
+    min_range: 20
+    line_type: SOLID
+
+  - id: pressure_graph_24h
+    sensor: pres_bme680
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: magenta
+    min_value: 930
+    max_value: 1010
+    min_range: 10
+    line_type: SOLID
+
+  - id: co2_graph_24h
+    sensor: co2_scd40
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: cyan
+    min_value: 400
+    max_value: 2000
+    min_range: 200
+    line_type: SOLID
+
+  - id: voc_graph_24h
+    sensor: tvoc_ens160
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: orange
+    min_value: 0
+    max_value: 600
+    min_range: 100
+    line_type: SOLID
+
+  - id: pm1_graph_24h
+    sensor: pm1_pms
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: orange
+    min_value: 0
+    max_value: 15
+    min_range: 5
+    line_type: SOLID
+
+  - id: pm25_graph_24h
+    sensor: pm25_pms
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: purple
+    min_value: 0
+    max_value: 30
+    min_range: 5
+    line_type: SOLID
+
+  - id: pm10_graph_24h
+    sensor: pm10_pms
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: green
+    min_value: 0
+    max_value: 55
+    min_range: 11
+    line_type: SOLID
+
+  - id: dew_point_graph_24h
+    sensor: dew_point_bme680
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: cyan
+    min_value: -10
+    max_value: 15
+    min_range: 5
+    line_type: SOLID
+
+  - id: light_graph_24h
+    sensor: ambient_light_ltr390
+    duration: 24h
+    x_grid: 2h
+    width: 146
+    height: 51
+    color: yellow
+    min_value: 0
+    max_value: 2000
+    min_range: 500
+    line_type: SOLID
+
+# Display
+   #show_test_card: true
+display:
+  - platform: mipi_spi
+    model: ILI9341
+    id: display_main
+    cs_pin: GPIO03
+    dc_pin: GPIO04
+    reset_pin: GPIO06
+    spi_id: display_spi_bus
+    # mipi_spi defaults to 10 MHz; ili9xxx ran at 40 MHz.
+    data_rate: 40MHz
+    # Explicit transform replaces the model default (mirror_x: true); same MADCTL as ili9xxx before (BGR | MY).
+    transform:
+      mirror_x: false
+      mirror_y: true
+      swap_xy: false
+    color_order: bgr
+    invert_colors: false
+    update_interval: 4s
+    lambda: |-
+      // The page is drawn by draw_screen, which the lambda calls once for the display and, after a print
+      // request, a second time into the 1-bit printer canvas (thermal_print.h).
+      auto draw_screen = [&](display::Display &it) {
+      auto w = it.get_width();
+      auto h = it.get_height();
+      auto fv30 = id(font_value_30);
+      auto fh36 = id(font_heading_36);
+      auto fl14 = id(font_label_14);
+      auto fl18 = id(font_label_18);
+      auto col = id(white);
+      int current_main_display_mode = id(main_display_mode);
+      auto co2 = id(co2_scd40).state;
+      auto ch2o = id(ch2o_ze08).state;
+      auto e_voc = id(tvoc_ens160).state;
+      auto pm1 = id(pm1_pms).state;
+      auto pm25 = id(pm25_pms).state;
+      auto pm10 = id(pm10_pms).state;
+      auto aqi_voc = id(aqi_voc_sgp41).state;
+      auto aqi_nox = id(aqi_nox_sgp41).state;
+      auto ens160_aqi = id(aqi_ens160).state;
+      float pressure = id(pres_bme680).state;
+      float dew_point = id(dew_point_bme680).state;
+      float abs_humidity = id(calculated_absolute_humidity).state;
+      float altitude = id(calculated_altitude).state;
+      auto light = id(ambient_light_ltr390).state;
+      col = id(white); if (co2 > 800){col = id(yellow);} if (co2 > 1200){col = id(orange);} if (co2 > 1500){col = id(red);} if (co2 > 1800){col = id(purple);} auto co2_c = col;
+      col = id(white); if (ch2o > 60){col = id(yellow);} if (ch2o > 100){col = id(orange);} if (ch2o > 150){col = id(red);} if (ch2o > 200){col = id(purple);} auto ch2o_c = col;
+      col = id(white); if (e_voc > 400){col = id(yellow);} if (e_voc > 800){col = id(orange);} if (e_voc > 1400){col = id(red);} if (e_voc > 2000){col = id(purple);} auto e_voc_c = col;
+      col = id(white); if (pm1 > 5){col = id(yellow);} if (pm1 > 10){col = id(orange);} if (pm1 > 15){col = id(red);} if (pm1 > 25){col = id(purple);} auto pm1_c = col;
+      col = id(white); if (pm25 > 5){col = id(yellow);} if (pm25 > 10){col = id(orange);} if (pm25 > 15){col = id(red);} if (pm25 > 25){col = id(purple);} auto pm25_c = col;
+      col = id(white); if (pm10 > 15){col = id(yellow);} if (pm10 > 45){col = id(orange);} if (pm10 > 60){col = id(red);} if (pm10 > 80){col = id(purple);} auto pm10_c = col;
+      col = id(white);
+      if (!isnan(light)) {
+        if (light < 50){col = id(grey);}
+        if (light > 200){col = id(yellow);}
+        if (light > 800){col = id(orange);}
+        if (light > 2000){col = id(red);}
+      }
+      auto light_c = col;
+      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
+      float hums[4] = {id(hum_bme680).state, id(hum_sht40).state, id(hum_scd40).state, id(hum_aht20_ens).state};
+      float temp = NAN;
+      float hum = NAN;
+      for (float t : temps) { if (!isnan(t)) { temp = t; break; } }
+      for (float h : hums) { if (!isnan(h)) { hum = h; break; } }
+      col = id(white); if (hum < 20){col = id(yellow);} if (hum > 75){col = id(red);} auto hum_c = col;
+      int temp_hum_display_offset_y = 0;
+      int top_section_height = 33;
+      int padding_after_top = 4;
+      int font_height_bottom = fl14->get_height();
+      int bottom_margin_val = 1;
+      int bottom_bar_height = font_height_bottom + bottom_margin_val;
+      int footer_start_y = h - bottom_bar_height;
+      it.filled_rectangle(0, 0, w, footer_start_y, Color::BLACK);
+      uint32_t global_current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
+      if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
+        id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+        id(last_top_toggle_time) = global_current_time_ms;
+      }
+      int current_top_display_mode = id(top_display_mode_toggle);
+      int left_col_x = 70;
+      int right_col_x = 190;
+      int graph_y_start = 10;
+      int graph_padding = 5;
+      int num_graphs_on_most_pages = 5;
+      int graph_height = (footer_start_y - graph_y_start - (num_graphs_on_most_pages-1) * graph_padding) / num_graphs_on_most_pages;
+      if (current_main_display_mode == 0) {
+        it.filled_rectangle(0, 0, w, top_section_height + padding_after_top, Color::BLACK);
+        if (current_top_display_mode == 0) {
+          int temp_left_x = 100;
+          it.printf(temp_left_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
+          if (!isnan(temp)) {
+              it.printf(temp_left_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", temp);
+          } else {
+              it.print(temp_left_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "RH");
+          it.print(right_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "\%");
+          if (!isnan(hum)) {
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", hum);
+          } else {
+              it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else if (current_top_display_mode == 1) {
+          it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Td °C");
+          if (!isnan(dew_point)) {
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", dew_point);
+          } else {
+              it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+
+          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "g/m³");
+          if (!isnan(abs_humidity)) {
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", abs_humidity);
+          } else {
+              it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else if (current_top_display_mode == 2) {
+          it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "hPa");
+          if (!isnan(pressure)) {
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", pressure);
+          } else {
+              it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "m");
+          if (!isnan(altitude)) {
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", altitude);
+          } else {
+              it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else if (current_top_display_mode == 3) {
+          if (!isnan(light)) {
+            it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", light);
+            it.print(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "lx");
+          } else {
+             it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Light");
+             it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+          // UV index, colored by the WHO scale.
+          float uvi = id(uv_index_ltr390).state;
+          it.print(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "UVI");
+          if (!isnan(uvi)) {
+              esphome::Color uvi_c = id(white);
+              if (uvi >= 11) { uvi_c = id(purple); }
+              else if (uvi >= 8) { uvi_c = id(red); }
+              else if (uvi >= 6) { uvi_c = id(orange); }
+              else if (uvi >= 3) { uvi_c = id(yellow); }
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, uvi_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", uvi);
+          } else {
+              it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else if (current_top_display_mode == 4) {
+          if (!isnan(ens160_aqi)) {
+              esphome::Color aqi_c = id(white);
+              if (ens160_aqi >= 5) { aqi_c = id(purple); }
+              else if (ens160_aqi >= 4) { aqi_c = id(red); }
+              else if (ens160_aqi >= 3) { aqi_c = id(orange); }
+              else if (ens160_aqi >= 2) { aqi_c = id(yellow); }
+              it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "AQI");
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, aqi_c, display::TextAlign::BOTTOM_RIGHT, "%.0f", ens160_aqi);
+          } else {
+              it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "AQI");
+              it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+          // BME680 BSEC2 IAQ (0-500); grey until BSEC2 reports "Calibrating" or "Calibrated".
+          float iaq = id(iaq_bme680).state;
+          const std::string &iaq_acc = id(iaq_accuracy_bme680).state;
+          bool iaq_calibrated = (iaq_acc == "Calibrating" || iaq_acc == "Calibrated");
+          it.print(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "IAQ");
+          if (!isnan(iaq)) {
+              esphome::Color iaq_c = id(grey);
+              if (iaq_calibrated) {
+                iaq_c = id(white);
+                if (iaq > 300) { iaq_c = id(purple); }
+                else if (iaq > 200) { iaq_c = id(red); }
+                else if (iaq > 100) { iaq_c = id(orange); }
+                else if (iaq > 50) { iaq_c = id(yellow); }
+              }
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, iaq_c, display::TextAlign::BOTTOM_RIGHT, "%.0f", iaq);
+          } else {
+              it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        }
+        auto cy_main = top_section_height + padding_after_top;
+        auto ix = 0;
+        auto title = "";
+        auto unit = "";
+        const char *names[3];
+        float values[3];
+        esphome::Color colors[3];
+        int count = 0;
+        if (!isnan(pm1)){
+          count = 0;
+          if(!isnan(pm1)) {names[count] = "PM1"; values[count] = pm1; colors[count] = pm1_c; count++;}
+          if(!isnan(pm25)) {names[count] = "PM2.5"; values[count] = pm25; colors[count] = pm25_c; count++;}
+          if(!isnan(pm10)) {names[count] = "PM10"; values[count] = pm10; colors[count] = pm10_c; count++;}
+          if (count > 0) {
+            title = "Particles"; unit = "µg/m³";
+            it.line(0,cy_main,w,cy_main,id(white));
+            it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+            it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
+            ix = 0;
+            for (int i = 0; i < count; i++){
+              it.printf(w/6*(1+ix*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", names[i]);
+              it.printf(w/6*(1+ix*2), cy_main + 50, fv30, colors[i], display::TextAlign::TOP_CENTER, "%.0f", values[i]);
+              ix++;
+            }
+            cy_main += 88;
+          }
+        }
+        // CO2: only the SCD40, the one sensor that measures CO2 (the eCO2 values are estimates from VOCs); in the
+        // left column like the first value of the other blocks.
+        if (!isnan(co2)) {
+          title = "CO2"; unit = "ppm";
+          it.line(0,cy_main,w,cy_main,id(white));
+          it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+          it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
+          it.print(w/6, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "SCD40");
+          it.printf(w/6, cy_main + 50, fv30, co2_c, display::TextAlign::TOP_CENTER, "%.0f", co2);
+          cy_main += 88;
+        }
+        // VOC: ZE08 CH2O, ENS160 TVOC and SGP41 VOC index, left to right in the order they first delivered a
+        // value since boot (the ZE08 is usually first, the ENS160 follows after its warm-up). A column keeps its
+        // place and stays empty if its sensor loses its value; a sensor that never delivers (the SGP41 while it
+        // isn't fitted) gets no column. The SGP41 NOx index sits small above "ppb" and only appears with a value
+        // (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
+        if (!isnan(e_voc) || !isnan(ch2o) || !isnan(aqi_voc) || !isnan(aqi_nox)) {
+          title = "VOC";
+          unit = "ppb";
+          it.line(0,cy_main,w,cy_main,id(white));
+          it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+          it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
+          esphome::Color aqi_voc_c = id(white);
+          if (aqi_voc > 50) { aqi_voc_c = id(yellow); }
+          if (aqi_voc > 150) { aqi_voc_c = id(orange); }
+          if (aqi_voc > 250) { aqi_voc_c = id(red); }
+          if (aqi_voc > 350) { aqi_voc_c = id(purple); }
+          const char *voc_names[3] = {"ZE08-CH2O", "ENS160", "SGP41 idx"};
+          float voc_values[3] = {ch2o, e_voc, aqi_voc};
+          esphome::Color voc_colors[3] = {ch2o_c, e_voc_c, aqi_voc_c};
+          static int voc_order[3];  // sensor index per column, filled as sensors deliver their first value
+          static int voc_columns = 0;
+          for (int s = 0; s < 3; s++) {
+            if (isnan(voc_values[s])) continue;
+            bool placed = false;
+            for (int col = 0; col < voc_columns; col++) placed |= voc_order[col] == s;
+            if (!placed) voc_order[voc_columns++] = s;
+          }
+          for (int col = 0; col < voc_columns; col++) {
+            int s = voc_order[col];
+            if (isnan(voc_values[s])) continue;
+            it.printf(w/6*(1+col*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", voc_names[s]);
+            it.printf(w/6*(1+col*2), cy_main + 50, fv30, voc_colors[s], display::TextAlign::TOP_CENTER, "%.0f", voc_values[s]);
+          }
+          if(!isnan(aqi_nox)){
+            esphome::Color aqi_nox_c = id(white);
+            if (aqi_nox > 50) { aqi_nox_c = id(yellow); }
+            if (aqi_nox > 150) { aqi_nox_c = id(orange); }
+            if (aqi_nox > 250) { aqi_nox_c = id(red); }
+            if (aqi_nox > 350) { aqi_nox_c = id(purple); }
+            it.printf(w-2, cy_main + 14, fl14, aqi_nox_c, TextAlign::CENTER_RIGHT, "%.0f", aqi_nox);
+            it.print(w-30, cy_main + 14, fl14, id(grey), TextAlign::CENTER_RIGHT, "NOx");
+          }
+          cy_main += 88;
+        }
+      } else if (current_main_display_mode == 1) {
+         int graph_y_current = graph_y_start;
+         int label_col_x = 80;
+         int graph_col_x = 85;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb  %d", 600);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(voc_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2000);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
+         it.graph(graph_col_x, graph_y_current, id(co2_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 15);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM1");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm1_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 30);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM2.5");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm25_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 55);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM10");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm10_graph));
+         graph_y_current += graph_height + graph_padding;
+      } else if (current_main_display_mode == 2) {
+         int graph_y_current = graph_y_start;
+         int label_col_x = 80;
+         int graph_col_x = 85;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 30.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Temp");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", 10.0);
+         it.graph(graph_col_x, graph_y_current, id(temperature_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "%%RH  %.0f", 100.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Humidity");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph(graph_col_x, graph_y_current, id(humidity_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "hPa  %.0f", 1010.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Pressure");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
+         it.graph(graph_col_x, graph_y_current, id(pressure_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", 0.0);
+         it.graph(graph_col_x, graph_y_current, id(dew_point_graph));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx  %.0f", 2000.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Light");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph(graph_col_x, graph_y_current, id(light_graph));
+         graph_y_current += graph_height + graph_padding;
+      } else if (current_main_display_mode == 3) {
+         auto cy_info = 10;
+         it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Alarm Conditions");
+         cy_info += fl18->get_height() + 3;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CO2 (SCD40) > %.0f ppm", id(co2_alarm_threshold).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CH2O > %.0f ppb", id(ch2o_alarm_threshold).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC (ENS160) > %.0f ppb", id(tvoc_alarm_threshold_ens).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC (SGP30) > %.0f ppb", id(tvoc_alarm_threshold_sgp30).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM1) > %.0f µg/m³", id(pm1_alarm_threshold).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM2.5) > %.0f µg/m³", id(pm25_alarm_threshold).state);
+         cy_info += fl14->get_height() + 1;
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM10) > %.0f µg/m³", id(pm10_alarm_threshold).state);
+         cy_info += fl14->get_height() + 5;
+         it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Graph Timeframes");
+         cy_info += fl18->get_height() + 3;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 3: 1h Heap PSRAM Loop");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 4: 1h TVOC CO2 Particles");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 5: 1h Temp RH hPa Td Lux");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 6: 24h TVOC CO2 Particles");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 7: 24h Temp RH hPa Td Lux");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 8: QR Code Web UI");
+      } else if (current_main_display_mode == 6) {
+         int graph_y_current = graph_y_start;
+         int label_col_x = 80;
+         int graph_col_x = 85;
+         int storage_graph_spacing = 2;
+         int num_graphs_on_this_page = 5;
+         int graph_height_storage = (footer_start_y - graph_y_start - (num_graphs_on_this_page-1) * storage_graph_spacing) / num_graphs_on_this_page;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 350.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Heap Free");
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph (graph_col_x, graph_y_current, id(heap_free_graph_1h));
+         graph_y_current += graph_height_storage + storage_graph_spacing;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 100.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Heap Block");
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph (graph_col_x, graph_y_current, id(heap_max_block_graph_1h));
+         graph_y_current += graph_height_storage + storage_graph_spacing;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 2000.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PSRAM");
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph (graph_col_x, graph_y_current, id(free_psram_graph_1h));
+         graph_y_current += graph_height_storage + storage_graph_spacing;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "ms  %.0f", 350.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Loop Time");
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph (graph_col_x, graph_y_current, id(loop_time_graph_1h));
+      } else if (current_main_display_mode == 4) {
+         int graph_y_current = graph_y_start;
+         int label_col_x = 80;
+         int graph_col_x = 85;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb  %d", 600);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(voc_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2000);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
+         it.graph(graph_col_x, graph_y_current, id(co2_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 15);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM1");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm1_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 30);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM2.5");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm25_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 55);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM10");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
+         it.graph(graph_col_x, graph_y_current, id(pm10_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+      } else if (current_main_display_mode == 5) {
+         int graph_y_current = graph_y_start;
+         int label_col_x = 80;
+         int graph_col_x = 85;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 30.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Temp");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", 10.0);
+         it.graph(graph_col_x, graph_y_current, id(temperature_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "%%RH  %.0f", 100.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Humidity");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph(graph_col_x, graph_y_current, id(humidity_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "hPa  %.0f", 1010.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Pressure");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
+         it.graph(graph_col_x, graph_y_current, id(pressure_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", -10.0);
+         it.graph(graph_col_x, graph_y_current, id(dew_point_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx  %.0f", 2000.0);
+         it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Light");
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.graph(graph_col_x, graph_y_current, id(light_graph_24h));
+         graph_y_current += graph_height + graph_padding;
+      } else if (current_main_display_mode == 7) {
+         auto current_ip = wifi::global_wifi_component->wifi_sta_ip_addresses()[0];
+         char ip_buf[40];
+         current_ip.str_to(ip_buf);
+         char url_str[48];
+         sprintf(url_str, "http://%s", ip_buf);
+         id(webserver_qr).set_value(url_str);
+         auto qr_matrix_size = id(webserver_qr).get_size();
+         int max_scale_w = w / qr_matrix_size;
+         int max_scale_h = (footer_start_y - (fl14->get_height() + 10)) / qr_matrix_size;
+         int scale = std::min(max_scale_w, max_scale_h);
+         if (scale <= 0) scale = 1;
+         auto drawn_qr_size = qr_matrix_size * scale;
+         int qr_x = (w - drawn_qr_size) / 2;
+         int qr_y = (footer_start_y - (fl14->get_height() + 10) - drawn_qr_size) / 2 + 10;
+         id(webserver_qr).draw(&it, qr_x, qr_y, Color::WHITE, scale);
+         it.print(w/2, footer_start_y - 10, fl14, id(grey), TextAlign::BOTTOM_CENTER, "Scan for Webserver");
+      }
+      int text_baseline_y = h - bottom_margin_val - 4;
+      it.filled_rectangle(0, footer_start_y, w, bottom_bar_height, Color::BLACK);
+      int displayed_page_number;
+      if (current_main_display_mode == 0) displayed_page_number = 1;
+      else if (current_main_display_mode == 3) displayed_page_number = 2;
+      else if (current_main_display_mode == 6) displayed_page_number = 3;
+      else if (current_main_display_mode == 1) displayed_page_number = 4;
+      else if (current_main_display_mode == 2) displayed_page_number = 5;
+      else if (current_main_display_mode == 4) displayed_page_number = 6;
+      else if (current_main_display_mode == 5) displayed_page_number = 7;
+      else if (current_main_display_mode == 7) displayed_page_number = 8;
+      else displayed_page_number = 0;
+      int total_pages = 8;
+      if (current_main_display_mode == 0) {
+        uint32_t current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
+        if (current_time_ms - id(last_bottom_toggle_time) >= 10000) {
+          id(display_mode_toggle) = 1 - id(display_mode_toggle);
+          id(last_bottom_toggle_time) = current_time_ms;
+        }
+        int current_display_mode_bottom = id(display_mode_toggle);
+        if (current_display_mode_bottom == 0) {
+          auto now = id(esptime).now();
+          if (now.is_valid()) {
+            it.strftime(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "%d.%m.%Y", now);
+            it.strftime(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%H:%M", now);
+          }
+        } else {
+          auto current_ip = wifi::global_wifi_component->wifi_sta_ip_addresses()[0];
+          char ip_str[40];
+          current_ip.str_to(ip_str);
+          it.print(10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, App.get_name().c_str());
+          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, ip_str);
+        }
+      } else if (current_main_display_mode == 1) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+      } else if (current_main_display_mode == 2) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+      } else if (current_main_display_mode == 3) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Info Page");
+          float altitude = id(calculated_altitude).state;
+          if (isnan(altitude)) {
+              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- m");
+          } else {
+              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f m", altitude);
+          }
+      } else if (current_main_display_mode == 6) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Ram CPU");
+          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+      } else if (current_main_display_mode == 4) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+      } else if (current_main_display_mode == 5) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+      } else if (current_main_display_mode == 7) {
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "QR Code");
+      }
+      char page_indicator_str[6];
+      sprintf(page_indicator_str, "%d/%d", displayed_page_number, total_pages);
+      it.print(w / 2, text_baseline_y, fl14, id(light_grey), TextAlign::BOTTOM_CENTER, page_indicator_str);
+      };
+      draw_screen(it);
+      if (id(print_requested)) {
+        id(print_requested) = false;
+        auto &canvas = thermalprint::canvas();
+        canvas.clear_bits();
+        canvas.set_ink_threshold(id(print_ink_threshold).state);
+        draw_screen(canvas);
+        auto now = id(esptime).now();
+        thermalprint::Options opt;  // "Print ..." entities in the web UI, section "Printer"
+        opt.large = id(print_size).active_index().value_or(1) == 1;
+        opt.header = id(print_header).state;
+        opt.feed_lines = id(print_feed_lines).state;
+        thermalprint::start(id(printer_host).state, ${printer_port}, App.get_friendly_name().c_str(),
+                            now.is_valid() ? now.strftime("%d.%m.%Y  %H:%M") : std::string(), opt);
+        id(print_seen_state) = -1;
+      }
+      // Print result box, drawn after the printer copy so it only shows on the screen.
+      if (id(print_toast) != 0) {
+        bool sent = id(print_toast) == 1;
+        auto color = sent ? id(green) : id(red);
+        int bw = 190, bh = 50;
+        int bx = (it.get_width() - bw) / 2, by = (it.get_height() - bh) / 2;
+        it.filled_rectangle(bx, by, bw, bh, Color::BLACK);
+        it.rectangle(bx, by, bw, bh, color);
+        it.rectangle(bx + 1, by + 1, bw - 2, bh - 2, color);
+        it.print(bx + bw / 2, by + bh / 2, id(font_value_30), color, TextAlign::CENTER,
+                 sent ? "Copy sent" : "Send failed");
+      }
+    dimensions:
+      height: 320
+      width: 240
+
+# interfaces
+uart:
+  - tx_pin: GPIO10
+    rx_pin: GPIO09
+    baud_rate: 9600
+    id: uart_ze08
+    parity: none
+    data_bits: 8
+    stop_bits: 1
+    debug: 
+      direction: BOTH
+      dummy_receiver: true
+      after:
+        # bytes: 9 
+        timeout: 10ms
+      sequence:
+        - lambda: |-
+            //UARTDebug::log_int(direction, bytes, ',');
+            //UARTDebug::log_hex(direction, bytes, ',');
+            if (direction == UART_DIRECTION_RX)                      
+              {
+                  if (bytes.size() == 9)                               
+                    {
+                        if ( bytes[0] == 0xFF &&
+                            bytes[1] == 0x17
+                            )       
+                          {
+                            float value = float((bytes[4] * 256) + bytes[5]);
+                            id(ch2o_ze08).publish_state(value);
+                          }
+                    }
+              }
+
+  - tx_pin: GPIO08
+    rx_pin: GPIO07
+    baud_rate: 9600
+    id: uart_pms
+
+spi:
+  # Gets SPI2 (the only ESPHome SPI bus); sd_logger.h uses SPI3 for the SD card, so don't add a second bus here.
+  - id: display_spi_bus
+    clk_pin: GPIO01
+    mosi_pin: GPIO02
+    miso_pin: GPIO16
+
+i2c:
+  - sda: GPIO11
+    scl: GPIO12
+    scan: true
+    id: i2c_1
+    frequency: 100kHz
+
+  - sda: GPIO17
+    scl: GPIO18
+    scan: true
+    id: i2c_2
+    frequency: 100kHz
+
+# BME680 via Bosch BSEC2 (IAQ). License: private use only, don't distribute firmware binaries built with it.
+bme68x_bsec2_i2c:
+  - id: bme680_bsec
+    i2c_id: i2c_1
+    address: 0x77
+    model: bme680
+    supply_voltage: 3.3V
+    # Gas heater + IAQ every 5 min: less self-heating of the temperature reference than LP (3 s).
+    sample_rate: ULP
+    operating_age: 28d
+    # Calibration state to flash; 1h instead of 6h so a reboot or flash loses at most an hour of learning.
+    state_save_interval: 1h
+
+# sensors
+sensor:
+  # SD card free space (sd_logger.h); NaN while no card is mounted.
+  - platform: template
+    name: "SD Card Free"
+    icon: "mdi:sd"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_sd_card
+      sorting_weight: 2
+    unit_of_measurement: "MB"
+    accuracy_decimals: 0
+    update_interval: 10min
+    lambda: |-
+      return sdlog::free_mb();
+
+  # Template Sensors
+  - platform: template
+    name: "ZE08 CH2O"
+    unit_of_measurement: ppb
+    state_class: measurement
+    device_class: volatile_organic_compounds
+    id: ch2o_ze08
+    icon: "mdi:gas-cylinder"
+    filters: 
+      - filter_out: 2000.0
+      - exponential_moving_average:
+          send_every: 30
+          alpha: 0.5
+
+  - platform: template
+    name: "SHT40 Dewpoint"
+    unit_of_measurement: "°C"
+    state_class: measurement
+    device_class: temperature
+    id: dew_point_sensor
+    icon: "mdi:water-thermometer"
+    lambda: |-
+      float temperature = id(temp_sht40).state;
+      float humidity = id(hum_sht40).state;
+      if (isnan(temperature) || isnan(humidity)) {
+        return NAN;
+      }
+      float a = 17.27;
+      float b = 237.7;
+      float alpha = ((a * temperature) / (b + temperature)) + log(humidity / 100.0);
+      return (b * alpha) / (a - alpha);
+    update_interval: 44s
+
+  # Reference dew point (BME680 is the temperature/humidity reference); used by the display and graphs.
+  - platform: template
+    name: "BME680 Dewpoint"
+    unit_of_measurement: "°C"
+    state_class: measurement
+    device_class: temperature
+    id: dew_point_bme680
+    icon: "mdi:water-thermometer"
+    lambda: |-
+      float temperature = id(temp_bme680).state;
+      float humidity = id(hum_bme680).state;
+      if (isnan(temperature) || isnan(humidity)) {
+        return NAN;
+      }
+      float a = 17.27;
+      float b = 237.7;
+      float alpha = ((a * temperature) / (b + temperature)) + log(humidity / 100.0);
+      return (b * alpha) / (a - alpha);
+    update_interval: 44s
+
+  - platform: template
+    name: "Calculated Absolute Humidity"
+    id: calculated_absolute_humidity
+    icon: "mdi:water-percent"
+    unit_of_measurement: "g/m³"
+    update_interval: 48s
+    lambda: |-
+      float t = NAN;
+      float rh = NAN;
+      if (!isnan(id(temp_bme680).state) && !isnan(id(hum_bme680).state)) {
+        t = id(temp_bme680).state;
+        rh = id(hum_bme680).state;
+      }
+      else if (!isnan(id(temp_sht40).state) && !isnan(id(hum_sht40).state)) {
+        t = id(temp_sht40).state;
+        rh = id(hum_sht40).state;
+      }
+      else {
+        float temps[2] = {id(temp_scd40).state, id(temp_aht20_ens).state};
+        float hums[2] = {id(hum_scd40).state, id(hum_aht20_ens).state};
+        for(int i = 0; i < 2; i++) {
+          if(!isnan(temps[i]) && !isnan(hums[i])) {
+            t = temps[i];
+            rh = hums[i];
+            break;
+          }
+        }
+      }
+      if (isnan(t) || isnan(rh)) return NAN;
+      float svp = 6.112 * exp((17.67 * t) / (t + 243.5));
+      float avp = svp * (rh / 100.0);
+      float abs_humidity = 216.7 * avp / (273.15 + t);
+      return abs_humidity;
+
+  # Select best sensor
+  - platform: template
+    name: "Best Temperature"
+    id: best_temperature
+    icon: "mdi:thermometer"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    lambda: |-
+      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
+      float selected_temp = NAN;
+      for(int i = 0; i < 4; i++){
+        if(!isnan(temps[i])){
+          selected_temp = temps[i];
+          break;
+        }
+      }
+      return selected_temp;
+
+  - platform: template
+    name: "Calculated Altitude"
+    id: calculated_altitude
+    unit_of_measurement: "m"
+    state_class: "measurement"
+    icon: "mdi:mountain"
+    update_interval: 15min
+    lambda: |-
+      float local_pressure = NAN;
+      if (id(pres_bme680).has_state()) {
+          local_pressure = id(pres_bme680).state;
+      }
+      float local_temperature = NAN;
+      if (id(temp_bme680).has_state()) {
+          local_temperature = id(temp_bme680).state;
+      }
+      float sea_level_pressure_ref = id(manual_sea_level_pressure).state;  // Deklaration und Initialisierung
+      if (!isnan(local_pressure) && !isnan(local_temperature) && !isnan(sea_level_pressure_ref)) {
+          if (local_pressure > 0 && sea_level_pressure_ref > 0) {
+              float altitude = (pow(sea_level_pressure_ref / local_pressure, 1.0/5.257) - 1.0) * (local_temperature + 273.15) / 0.0065;
+              return altitude;
+          }
+      }
+      return NAN;
+
+  - platform: template
+    name: "ENS160 Warmup Max Remaining"
+    id: ens160_warmup_remaining
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "min"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      // Upper bound only: the ENS160 publishes as soon as its data is valid.
+      if (id(eco2_ens160).has_state()) return 0;
+      int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
+      if (elapsed_min >= 60) return 0;
+      return 60 - (int) elapsed_min;
+      
+  # Debug Sensors
+  - platform: debug
+    free:
+      name: "Heap Free (Bytes)"
+      id: heap_free
+      disabled_by_default: True
+    block:
+      name: "Heap Max Block (Bytes)"
+      id: heap_block
+      disabled_by_default: True
+    psram:
+      name: "PSRAM Free (Bytes)"
+      id: free_psram
+      disabled_by_default: True
+    loop_time:
+      name: "Loop Time"
+      id: loop_time
+      disabled_by_default: False
+    cpu_frequency:
+      name: "CPU Frequency"
+      id: cpu_frequency
+      disabled_by_default: True
+
+  - platform: template
+    name: "Heap Free (KB)"
+    id: heap_free_kb
+    icon: "mdi:memory"
+    unit_of_measurement: "KB"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: |-
+      if (isnan(id(heap_free).state)) return NAN;
+      return id(heap_free).state / 1024.0;
+
+  - platform: template
+    name: "Heap Max Block (KB)"
+    id: heap_max_block_kb
+    icon: "mdi:memory"
+    entity_category: diagnostic
+    unit_of_measurement: "KB"
+    accuracy_decimals: 0
+    lambda: |-
+      if (isnan(id(heap_block).state)) return NAN;
+      return id(heap_block).state / 1024.0;
+
+  - platform: template
+    name: "PSRAM Free (KB)"
+    id: free_psram_kb
+    icon: "mdi:memory"
+    entity_category: diagnostic
+    unit_of_measurement: "KB"
+    accuracy_decimals: 0 
+    lambda: |-
+      if (isnan(id(free_psram).state)) return NAN;
+      return id(free_psram).state / 1024.0;
+
+  - platform: uptime
+    name: "Uptime (Seconds)"
+    id: uptime_sensor
+    icon: "mdi:update"
+    entity_category: diagnostic
+    update_interval: 55s
+    disabled_by_default: True
+
+  - platform: template
+    name: "Uptime (Minutes)"
+    id: uptime_minutes
+    icon: "mdi:update"
+    entity_category: diagnostic
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    lambda: |-
+      if (isnan(id(uptime_sensor).state)) return NAN;
+      return id(uptime_sensor).state / 60.0;
+
+  - platform: wifi_signal
+    name: "WiFi Strength"
+    entity_category: diagnostic
+    icon: "mdi:wifi"
+    update_interval: 60s
+
+  - platform: template
+    name: "CPU Frequency MHz"
+    icon: "mdi:cpu-32-bit"
+    entity_category: diagnostic
+    unit_of_measurement: "MHz"
+    lambda: |-
+      if (id(cpu_frequency).has_state()) {
+        float freq = id(cpu_frequency).state;
+        if (freq > 0) {
+          return {static_cast<float>(round(freq / 1000000 * 100) / 100)};
+        } else {
+          return {NAN};
+        }
+      } else {
+        return {NAN};
+      }
+    update_interval: 66s
+
+  # I2C 1 Bus
+  - platform: sht4x
+    address: 0x44
+    i2c_id: i2c_1
+    temperature:
+      name: "SHT40 Temperature"
+      id: temp_sht40
+      icon: "mdi:thermometer"
+      filters:
+        - offset: !lambda return id(temp_sht40_offset).state;
+    humidity:
+      name: "SHT40 Relative Humidity"
+      id: hum_sht40
+      icon: "mdi:water-percent"
+      filters:
+        - offset: !lambda return id(hum_sht40_offset).state;
+    precision: High
+    update_interval: 79s
+
+  - platform: scd4x
+    address: 0x62
+    i2c_id: i2c_1
+    co2:
+      name: "SCD40 CO2"
+      id: co2_scd40
+      icon: "mdi:molecule-co2"
+    temperature:
+      name: "SCD40 Temperature"
+      id: temp_scd40
+      icon: "mdi:thermometer"
+      filters:
+        - offset: !lambda return id(temp_scd40_offset).state;
+    humidity:
+      name: "SCD40 Humidity"
+      id: hum_scd40
+      icon: "mdi:water-percent"
+      filters:
+        - offset: !lambda return id(hum_scd40_offset).state;
+    automatic_self_calibration: true
+    ambient_pressure_compensation_source: pres_bme680
+    update_interval: 33s
+
+  - platform: sgp30
+    i2c_id: i2c_1
+    address: 0x58
+    eco2:
+      name: "SGP30 eCO2"
+      id: eco2_sgp30
+      icon: "mdi:molecule-co2"
+      accuracy_decimals: 0
+      filters: 
+        - exponential_moving_average: 
+            send_every: 1
+            alpha: 0.2
+    tvoc:
+      name: "SGP30 TVOC"
+      id: tvoc_sgp30
+      accuracy_decimals: 1
+      filters: 
+        - exponential_moving_average: 
+            send_every: 1
+            alpha: 0.2
+    store_baseline: yes
+    update_interval: 36s
+    compensation: 
+      humidity_source: hum_bme680
+      temperature_source: temp_bme680
+
+  - platform: sgp4x
+    i2c_id: i2c_1
+    #address: 0x59
+    voc_index:
+      name: "SGP41 VOC Index"
+      id: aqi_voc_sgp41
+      disabled_by_default: True
+      icon: "mdi:radiator"
+      device_class: aqi
+      state_class: measurement
+      unit_of_measurement: "index points"
+    nox_index:
+      name: "SGP41 NOx Index"
+      id: aqi_nox_sgp41
+      disabled_by_default: True
+      icon: "mdi:radiator"
+      device_class: aqi
+      state_class: measurement
+      unit_of_measurement: "index points"
+    compensation: 
+      humidity_source: hum_bme680
+      temperature_source: temp_bme680
+    store_baseline: True
+    update_interval: 41s
+
+  - platform: ltr390
+    id: uv_light_ltr390
+    address: 0x53
+    i2c_id: i2c_1
+    uv_index:
+      name: "LTR390 UV Index"
+      id: uv_index_ltr390
+      icon: "mdi:sun-wireless-outline"
+    light:
+      name: "LTR390 Ambient Light"
+      icon: "mdi:weather-sunny"
+      id: ambient_light_ltr390
+      on_value:
+        then:
+          - script.execute: adjust_backlight_based_on_light
+    gain: X3
+    resolution: 18   
+    update_interval: 11s
+
+  # All outputs follow the hub's ULP rate (every 5 min). Per-sensor LP with a ULP hub fails at setup:
+  # BSEC2 status 14 = BSEC_W_SU_SAMPLERATEMISMATCH.
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bme680_bsec
+    temperature:
+      name: "BME680 Temperature"
+      id: temp_bme680
+      icon: "mdi:thermometer"
+      filters:
+        - offset: !lambda return id(temp_bme680_offset).state;
+    pressure:
+      name: "BME680 Pressure"
+      id: pres_bme680
+      icon: "mdi:mountain"
+    humidity:
+      name: "BME680 Humidity"
+      id: hum_bme680
+      icon: "mdi:water-percent"
+      filters:
+        - offset: !lambda return id(hum_bme680_offset).state;
+    gas_resistance:
+      name: "BME680 Gas Resistance"
+      id: gas_resistance_bme680
+      icon: "mdi:omega"
+    iaq:
+      name: "BME680 Indoor Air Quality"
+      id: iaq_bme680
+      icon: "mdi:gauge"
+    iaq_static:
+      name: "BME680 Static IAQ"
+      id: iaq_static_bme680
+      icon: "mdi:gauge"
+    co2_equivalent:
+      name: "BME680 CO2 Equivalent"
+      id: co2eq_bme680
+      icon: "mdi:molecule-co2"
+    breath_voc_equivalent:
+      name: "BME680 Breath VOC Equivalent"
+      id: bvoc_bme680
+      icon: "mdi:air-filter"
+
+  # I2C 2 Bus
+  - platform: aht10
+    address: 0x38
+    i2c_id: i2c_2
+    variant: AHT20
+    temperature:
+      name: "AHT20 ENS160 Temperature"
+      id: temp_aht20_ens
+      icon: "mdi:thermometer"
+      disabled_by_default: false
+      filters:
+        - offset: !lambda return id(temp_aht20_ens_offset).state;
+    humidity:
+      name: "AHT20 ENS160 Humidity"
+      id: hum_aht20_ens
+      icon: "mdi:water-percent"
+      disabled_by_default: false
+      filters:
+        - offset: !lambda return id(hum_aht20_ens_offset).state;
+    update_interval: 73s
+
+  - platform: ens160_i2c
+    id: ens160_chip
+    address: 0x53
+    i2c_id: i2c_2
+    eco2:
+      name: "ENS160 eCO2"
+      id: eco2_ens160
+      icon: "mdi:molecule-co2"
+    tvoc:
+      name: "ENS160 TVOC"
+      id: tvoc_ens160
+      filters: 
+        - exponential_moving_average: 
+            send_every: 1
+            alpha: 0.5
+    aqi:
+      name: "ENS160 Air Quality Index"
+      id: aqi_ens160
+    update_interval: 17s
+    compensation:
+      temperature: temp_bme680
+      humidity: hum_bme680
+
+  # Serial Bus
+  - platform: pmsx003
+    type: PMSX003
+    # Above 30 s the sensor sleeps between readings and wakes 30 s early: 30 s on, 90 s off.
+    update_interval: 120s
+    uart_id: uart_pms
+    pm_1_0:
+      name: "PMS Particulate Matter <1.0µm Concentration"
+      id: pm1_pms
+    pm_2_5:
+      name: "PMS Particulate Matter <2.5µm Concentration"
+      id: pm25_pms
+    pm_10_0:
+      name: "PMS Particulate Matter <10.0µm Concentration"
+      id: pm10_pms
+
+# Buzzer with Auto Alert
+switch:
+  # Screen print (thermal_print.h): box name and date above the image.
+  - platform: template
+    name: "Print Header"
+    id: print_header
+    icon: "mdi:format-header-1"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 5
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: "Buzzer"
+    id: buzzer_switch
+    icon: "mdi:alarm-light-outline"
+    optimistic: true
+    turn_on_action:
+      - output.turn_on: buzzer_output
+      - output.ledc.set_frequency:
+          id: buzzer_output
+          frequency: "2441Hz"
+      - output.set_level:
+          id: buzzer_output
+          level: "75%"
+    turn_off_action:
+      - output.turn_off: buzzer_output
+
+  - platform: template
+    name: "Buzzer Alarm Aktiv"
+    id: buzzer_alarm_enable_switch
+    entity_category: config
+    icon: "mdi:alarm-light"
+    optimistic: true
+    lambda: |-
+      return id(buzzer_alarm_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(buzzer_alarm_enabled) = true;
+          ESP_LOGD("Buzzer", "Buzzer Alarm enabled");
+    turn_off_action:
+      - lambda: |-
+          id(buzzer_alarm_enabled) = false;
+          ESP_LOGD("Buzzer", "Buzzer Alarm disabled");
+
+  - platform: restart
+    name: ${name} restart
+    entity_category: diagnostic
+
+# Buttons
+button:
+  # Factory Reset
+  - platform: factory_reset
+    name: "Factory Reset"
+    entity_category: diagnostic
+  # Save Mode
+  - platform: safe_mode
+    name: "Safe Mode"
+    entity_category: diagnostic
+  # SD card (sd_logger.h): unmount before pulling the card (wait for "Not mounted (safe to remove)"; the
+  # sdlog task handles the request after a row in progress), mount after inserting it.
+  - platform: template
+    name: "SD Card Mount"
+    icon: "mdi:sd"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_sd_card
+      sorting_weight: 3
+    on_press:
+      - lambda: sdlog::request_mount();
+  - platform: template
+    name: "SD Card Unmount"
+    icon: "mdi:eject"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_sd_card
+      sorting_weight: 4
+    on_press:
+      - lambda: sdlog::request_unmount();
+  # Same as holding the top button for 5 s.
+  - platform: template
+    name: "Print Screen"
+    icon: "mdi:printer-pos"
+    web_server:
+      sorting_group_id: web_group_printer
+      sorting_weight: 3
+    on_press:
+      - script.execute: print_screen
+
+# Intervals
+interval:
+  # Screen print status: publish on change; when a print finished, show the result on the screen for 3 s
+  # (two beeps when it failed).
+  - interval: 500ms
+    then:
+      - lambda: |-
+          int state = thermalprint::state;
+          if (state == id(print_seen_state)) return;
+          id(print_seen_state) = state;
+          id(printer_status).publish_state(thermalprint::status_text());
+          if (state != thermalprint::DONE && state != thermalprint::FAILED) return;
+          if (state == thermalprint::FAILED) id(print_error_beep).execute();
+          id(print_toast) = state == thermalprint::DONE ? 1 : 2;
+          id(display_main).update();
+          App.scheduler.set_timeout(id(display_main), "print_toast", 3000, []() {
+            id(print_toast) = 0;
+            id(display_main).update();
+          });
+  # SD card log: one CSV row per minute into /sdcard/YYYYMMDD.CSV.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!sdlog::is_mounted()) return;
+          auto now = id(esptime).now();
+          if (!now.is_valid()) return;
+          static const char *const header =
+              "time,bme680_t,bme680_rh,bme680_p,bme680_gas,bme680_iaq,bme680_iaq_acc,bme680_iaq_static,"
+              "bme680_co2eq,bme680_bvoc,scd40_co2,scd40_t,scd40_rh,sgp30_eco2,sgp30_tvoc,"
+              "ens160_eco2,ens160_tvoc,ens160_aqi,ze08_ch2o,pm1,pm25,pm10,lux,uvi,"
+              "sht41_t,sht41_rh,aht21_t,aht21_rh,dew_bme680,dew_sht41,abs_hum";
+          char date[16];
+          now.strftime(date, sizeof(date), "%Y%m%d");
+          sdlog::Row row;
+          now.strftime(row.buf, sizeof(row.buf), "%Y-%m-%d %H:%M:%S");
+          row.len = strlen(row.buf);
+          row.num(id(temp_bme680).state, 2);
+          row.num(id(hum_bme680).state, 2);
+          row.num(id(pres_bme680).state, 1);
+          row.num(id(gas_resistance_bme680).state, 0);
+          row.num(id(iaq_bme680).state, 0);
+          row.text(id(iaq_accuracy_bme680).state);
+          row.num(id(iaq_static_bme680).state, 0);
+          row.num(id(co2eq_bme680).state, 0);
+          row.num(id(bvoc_bme680).state, 2);
+          row.num(id(co2_scd40).state, 0);
+          row.num(id(temp_scd40).state, 2);
+          row.num(id(hum_scd40).state, 2);
+          row.num(id(eco2_sgp30).state, 0);
+          row.num(id(tvoc_sgp30).state, 0);
+          row.num(id(eco2_ens160).state, 0);
+          row.num(id(tvoc_ens160).state, 0);
+          row.num(id(aqi_ens160).state, 0);
+          row.num(id(ch2o_ze08).state, 1);
+          row.num(id(pm1_pms).state, 0);
+          row.num(id(pm25_pms).state, 0);
+          row.num(id(pm10_pms).state, 0);
+          row.num(id(ambient_light_ltr390).state, 1);
+          row.num(id(uv_index_ltr390).state, 2);
+          row.num(id(temp_sht40).state, 2);
+          row.num(id(hum_sht40).state, 2);
+          row.num(id(temp_aht20_ens).state, 2);
+          row.num(id(hum_aht20_ens).state, 2);
+          row.num(id(dew_point_bme680).state, 2);
+          row.num(id(dew_point_sensor).state, 2);
+          row.num(id(calculated_absolute_humidity).state, 2);
+          sdlog::log_row(date, header, row);
+
+  # SD card: retry mounting every 10 min while no card is mounted (card inserted later, or pulled
+  # without unmounting). Runs in the sdlog task, so a slow or stuck card doesn't block the loop.
+  - interval: 10min
+    then:
+      - lambda: |-
+          if (!sdlog::is_mounted()) sdlog::request_mount();
+
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return (id(buzzer_alarm_enabled) &&
+                      (
+                        (id(co2_scd40).state > id(co2_alarm_threshold).state) ||
+                        (id(ch2o_ze08).state > id(ch2o_alarm_threshold).state) ||
+                        (id(tvoc_ens160).state > id(tvoc_alarm_threshold_ens).state) ||
+                        (id(tvoc_sgp30).state > id(tvoc_alarm_threshold_sgp30).state) ||
+                        (id(pm1_pms).state > id(pm1_alarm_threshold).state) ||
+                        (id(pm25_pms).state > id(pm25_alarm_threshold).state) ||
+                        (id(pm10_pms).state > id(pm10_alarm_threshold).state)
+                      ));
+          then:
+            - switch.turn_on: buzzer_switch
+            - delay: 1s
+            - switch.turn_off: buzzer_switch
+
+  - interval: 10s
+    then:
+      - lambda: |-
+          uint32_t last_press_time = id(last_button_press_timestamp);
+          uint32_t current_time = esp_timer_get_time() / 1000000ULL;
+          uint32_t time_since_last_button_press = current_time - last_press_time;
+          int current_mode = id(main_display_mode);
+          if (time_since_last_button_press >= 30 && current_mode != 0) {
+            id(main_display_mode) = 0;
+            id(display_main).update();
+          }
+
+# Timestamp-Service
+time:
+  - platform: sntp
+    id: esptime
+    timezone: "Europe/Berlin"
+    servers: "pool.ntp.org"
+
+# Scripts
+script:
+  # Screen print (thermal_print.h): the next display update draws the page into the printer canvas too.
+  - id: print_screen
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return thermalprint::busy();
+          then:
+            - logger.log:
+                level: WARN
+                format: "Screen print ignored: previous print still sending"
+            - script.execute: print_error_beep
+          else:
+            - lambda: |-
+                id(print_requested) = true;
+                App.scheduler.set_timeout(id(display_main), "print_screen", 0, []() { id(display_main).update(); });
+            - script.execute: print_beep
+  # Short confirmation beep; skipped while the buzzer switch is on (alarm).
+  - id: print_beep
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_off: buzzer_switch
+          then:
+            - output.ledc.set_frequency:
+                id: buzzer_output
+                frequency: "2441Hz"
+            - output.set_level:
+                id: buzzer_output
+                level: "75%"
+            - delay: 100ms
+            - output.turn_off: buzzer_output
+  - id: print_error_beep
+    mode: single
+    then:
+      - script.execute: print_beep
+      - script.wait: print_beep
+      - delay: 150ms
+      - script.execute: print_beep
+  - id: adjust_backlight_based_on_light
+    then:
+      - lambda: |-
+          // Single place that sets the backlight, with the levels from the web UI ("Backlight ..." numbers):
+          // "Presence" during boot, while presence is detected and within 15 s of a button press or the end
+          // of presence; otherwise "Dark" or "Bright" by ambient light (dark below 1 lx, bright again from
+          // 2 lx: hysteresis against flicker). 0 % switches the backlight off.
+          uint32_t now_s = esp_timer_get_time() / 1000000ULL;
+          bool someone = now_s < 30 || id(presencesensor).state ||
+                         now_s - id(last_button_press_timestamp) < 15 ||
+                         now_s - id(last_presence_release_timestamp) < 15;
+          float level;
+          if (someone) {
+            level = id(backlight_presence_level).state;
+          } else {
+            auto *light_sensor = id(ambient_light_ltr390);
+            float lux = light_sensor->state;
+            if (!light_sensor->has_state() || isnan(lux)) return;
+            id(backlight_dark) = id(backlight_dark) ? lux < 2 : lux < 1;
+            level = id(backlight_dark) ? id(backlight_dark_level).state : id(backlight_bright_level).state;
+          }
+          if (isnan(level)) return;
+          // Only act on a change: the LTR390 publishes every few seconds.
+          auto &target = id(back_light).remote_values;
+          float current = target.is_on() ? target.get_brightness() * 100.0f : 0.0f;
+          if (fabsf(current - level) < 0.5f) return;
+          // turn_on with brightness 0 would leave the light "on" at 0 %, so 0 % is an explicit turn_off.
+          auto call = level > 0.0f ? id(back_light).turn_on() : id(back_light).turn_off();
+          if (level > 0.0f) call.set_brightness(level / 100.0f);
+          call.perform();
+
+# | ------------------------------------------- |
+# | GPIO Pin | Notes.                           |
+# | :------- | :------------------------------- |
+# | GPIO00   | Free (Boot Button).              |
+# | GPIO01   | SPI CLK Pin                      |
+# | GPIO02   | SPI MOSI Pin                     |
+# | GPIO03   | Display CS Pin                   |
+# | GPIO04   | Display DC Pin                   |
+# | GPIO05   | Free (JTAG).                     |
+# | GPIO06   | Display Reset Pin                |
+# | GPIO07   | UART RX Pin (for PMS Sensor)     |
+# | GPIO08   | UART TX Pin (for PMS Sensor)     |
+# | GPIO09   | UART RX Pin (for ZE08 Sensor)    |
+# | GPIO10   | UART TX Pin (for ZE08 Sensor)    |
+# | GPIO11   | I2C SDA Pin (Main bus)           |
+# | GPIO12   | I2C SCL Pin (Main bus)           |
+# | GPIO13   | Top Button Input                 |
+# | GPIO14   | Free (JTAG)                      |
+# | GPIO15   | Display Backlight PWM Output     |
+# | GPIO16   | SPI MISO Pin                     |
+# | GPIO17   | I2C SDA Pin (Secondary Bus)      |
+# | GPIO18   | I2C SCL Pin (Secondary Bus)      |
+# | GPIO19   | N.A.                             |
+# | GPIO20   | N.A.                             |
+# | GPIO21   | N.A.                             |
+# | GPIO33   | N.A.                             |
+# | GPIO34   | N.A.                             |
+# | GPIO35   | SD card SPI3 CLK (display J4)    |
+# | GPIO36   | SD card SPI3 MISO (display J4)   |
+# | GPIO37   | SD card SPI3 MOSI (display J4)   |
+# | GPIO38   | SD card SPI3 CS (display J4)     |
+# | GPIO39   | SR602 PIR                        |
+# | GPIO40   | Buzzer PWM Output                |
+# | GPIO41   | N.A.                             |
+# | GPIO42   | N.A.                             |
+# | GPIO43   | N.A.                             |
+# | GPIO44   | N.A.                             |
+# | GPIO45   | N.A.                             |
+# | GPIO46   | N.A.                             |
+# | GPIO47   | N.A.                             |
+# | ------------------------------------------- |
+
+# I2C Bus 1:
+# SDA Pin: GPIO11
+# SCL Pin: GPIO12
+# i2c device at address 0x44 SHT41
+# i2c device at address 0x53 LTR390
+# i2c device at address 0x58 SGP30
+# i2c device at address 0x62 SCD40
+# i2c device at address 0x77 BME680
+
+# I2C Bus 2:
+# SDA Pin: GPIO17
+# SCL Pin: GPIO18
+# i2c device at address 0x38 ATH21
+# i2c device at address 0x53 ENS160
