@@ -1,83 +1,169 @@
-name: Release
+name: release
 
+# Builds the installable config bundle and drafts a GitHub Release from it.
+#
+# - A tag (v*) builds the bundle and creates a DRAFT release. Pushing a tag never publishes on its own:
+#   the draft is published by hand once the notes and the attached files have been checked.
+# - Pull requests and manual runs build and check the same bundle but create no release, so a broken
+#   bundle shows up before anyone tags.
+#
+# The bundle holds the ESPHome config, not a firmware image: the config uses Bosch BSEC2 (private use only,
+# no distribution of firmware built with it) and the WiFi credentials, API key and web UI login are compiled
+# into the firmware. Users compile it themselves (see Setup in the README).
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Never cancel a run that is cutting a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Package & draft release
+  bundle:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
 
-      # Source only, no firmware: the config uses Bosch BSEC2 (private use only, no distribution of firmware
-      # built with it) and the WiFi/API/web UI secrets are compiled into the firmware.
-      - name: Create source zip and Gerber zip
-        shell: bash
+      # A release must come from reviewed code: a tag, unlike a branch, can point anywhere.
+      - name: Tag must be on main
+        if: github.ref_type == 'tag'
         run: |
-          set -euo pipefail
-
-          version="${GITHUB_REF_NAME#v}"
-          name="sensor-box-enhanced-${version}"
-          mkdir dist
-
-          git archive --format=zip --prefix="${name}/" -o "dist/${name}.zip" HEAD \
-            esphome docs hardware LICENSE README.md SECURITY.md ':!esphome/.gitignore'
-
-          gerber="hardware/enhanced-addon-v0.2/AddonBoard v0.2.zip"
-          if [[ ! -f "$gerber" ]]; then
-            echo "Gerber zip not found: $gerber" >&2
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not on main"
             exit 1
           fi
-          cp "$gerber" "dist/addon-board-v0.2-gerber.zip"
 
-          # The config and both headers must be in the source zip, or the release is useless.
-          listing="$(unzip -Z1 "dist/${name}.zip")"
-          for f in airquality.yaml sd_logger.h thermal_print.h secrets.example.yaml; do
-            grep -qx "${name}/esphome/${f}" <<< "$listing" || { echo "Missing in zip: ${f}" >&2; exit 1; }
-          done
+      # The firmware reports esphome.project.version to Home Assistant. A release whose tag disagrees with
+      # it would ship a bundle that misreports its own version, so a tag must equal that string
+      # (v0.1.0 -> 0.1.0). Runs on pull requests too, without the comparison, so a change that breaks the
+      # lookup fails before anyone tags.
+      - name: Firmware version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          fw="$(awk '/^esphome:/{e=1;next} /^[^ #]/{e=0} e&&/^  project:/{p=1;next} e&&p&&/^  [^ ]/{p=0} e&&p&&/^    version:/{v=$2; gsub(/"/,"",v); print v; exit}' esphome/airquality.yaml)"
+          if [ -z "$fw" ]; then
+            echo "::error::no esphome.project.version found in esphome/airquality.yaml"
+            exit 1
+          fi
+          echo "firmware version: $fw"
+          if [ "$REF_TYPE" = tag ] && [ "${REF_NAME#v}" != "$fw" ]; then
+            echo "::error::tag ${REF_NAME} does not match esphome.project.version ${fw}; bump it in a pull request first"
+            exit 1
+          fi
 
-          (cd dist && sha256sum -- *.zip > SHA256SUMS.txt)
-          ls -la dist
+      - name: Build bundle
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then VERSION="${REF_NAME#v}"; else VERSION="dev-${GITHUB_SHA::7}"; fi
+          NAME="Sensor-Box-Enhanced-${VERSION}"
+          mkdir -p "dist/$NAME/hardware" "dist/$NAME/docs"
+          cp esphome/airquality.yaml esphome/sd_logger.h esphome/thermal_print.h esphome/secrets.example.yaml "dist/$NAME/"
+          cp docs/*.md "dist/$NAME/docs/"
+          cp hardware/enhanced-addon-v0.2/README.md "dist/$NAME/hardware/README.md"
+          cp "hardware/enhanced-addon-v0.2/AddonBoard v0.2.zip" "dist/$NAME/hardware/addon-board-v0.2-gerber.zip"
+          cp "hardware/enhanced-addon-v0.2/Addon Board v0.2.png" "dist/$NAME/hardware/addon-board-v0.2.png"
+          cp LICENSE SECURITY.md "dist/$NAME/"
+          cat > "dist/$NAME/INSTALL.md" <<'EOT'
+          # Install
+
+          1. Copy `secrets.example.yaml` to `secrets.yaml` and fill in all five values (WiFi SSID and
+             password, web UI user and password, API key). Generate the API key with
+             `openssl rand -base64 32`.
+          2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h` and `secrets.yaml` in one folder
+             (Home Assistant: `/homeassistant/esphome/`).
+          3. In `airquality.yaml`, adjust the time zone under `time:`. The device gets its address by DHCP;
+             for a fixed address add a `manual_ip:` block under `wifi:`.
+          4. First flash over USB: ESPHome Device Builder -> airquality -> Install -> Plug into this
+             computer, or `esphome run airquality.yaml` with the ESPHome CLI. After that, flash over the air.
+
+          The addon board (Gerber files and pinout) is in `hardware/`. More in the README:
+          https://github.com/Ajimaru/Sensor-Box-Enhanced#setup
+          EOT
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Proves the bundle is installable as shipped: the example must contain every secret the config asks
+      # for, and the config must resolve from the bundle folder.
+      - name: Check the bundle installs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install esphome
+          cd "dist/$NAME"
+          sed "s|^api_encryption_key: .*|api_encryption_key: \"$(openssl rand -base64 32)\"|" secrets.example.yaml > secrets.yaml
+          esphome config airquality.yaml > /dev/null
+          rm secrets.yaml
+
+      - name: Zip
+        run: |
+          cd dist
+          zip -rq "$NAME.zip" "$NAME"
+          sha256sum "$NAME.zip" > "$NAME.zip.sha256"
+          unzip -l "$NAME.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: dist
-          path: dist/*
+          name: bundle
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle
+          path: dist
 
       - name: Determine prerelease
         id: prerelease
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          TAG_LOWER="$(printf '%s' "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]')"
-          # Prerelease = a "-rc1", "-beta.2", "-alpha", "-dev" style suffix after the version number.
-          if echo "$TAG_LOWER" | grep -qE '^v?[0-9]+(\.[0-9]+)*-(a|b|alpha|beta|rc|dev|pre)([.-]?[0-9]+)?$'; then
+          TAG_LOWER="$(printf '%s' "$TAG" | tr '[:upper:]' '[:lower:]')"
+          # Prerelease = an a/b/rc/dev/alpha/beta segment in the tag, with a digit or separator before it
+          # (0.2.0-rc1, 0.2.0.dev3). The match must end at the end of the tag, so the letters inside a word
+          # can never flip the detection.
+          if echo "$TAG_LOWER" | grep -qE '(^|[-.0-9])(a|b|rc|dev|alpha|beta)([.-]?[0-9]+)?($|\+)'; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: dist/*
-          body: |
-            Source release, **no firmware binaries**: build the firmware yourself with ESPHome, see
-            [Setup](https://github.com/${{ github.repository }}#setup) in the README.
-
-            - `sensor-box-enhanced-*.zip`: ESPHome config, headers, `secrets.example.yaml`, docs and hardware files
-            - `addon-board-v0.2-gerber.zip`: Gerber and drill files of the addon board v0.2 for ordering
-            - `SHA256SUMS.txt`: checksums of both zips
-          # Notes are grouped by PR label; the categories live in .github/release.yml.
-          generate_release_notes: true
-          # Always a draft: a release is published by hand once the notes and the attached files have been
-          # checked. Pushing a tag must never publish on its own.
-          draft: true
-          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+      # Always a draft. Notes are grouped by PR label; the categories live in .github/release.yml.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.prerelease.outputs.is_prerelease }}
+        run: |
+          notes="Config bundle, **no firmware binaries**: build the firmware yourself with ESPHome, see [Setup](https://github.com/${GITHUB_REPOSITORY}#setup) in the README. The zip holds the ESPHome config, the headers, \`secrets.example.yaml\`, docs and the addon board files (Gerber, pinout)."
+          args=(--draft --generate-notes --notes "$notes" --title "$TAG" --repo "$GITHUB_REPOSITORY")
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$TAG" dist/* "${args[@]}"

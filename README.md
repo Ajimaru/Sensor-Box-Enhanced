@@ -4,6 +4,8 @@ ESPHome air quality monitor based on Tom's Sensorbox v2, with extra sensors, a f
 buzzer alarm, SD card logging and optional screen printouts on a thermal printer. It works on its own and
 connects to Home Assistant through the ESPHome API.
 
+[![Release](https://img.shields.io/github/v/release/Ajimaru/Sensor-Box-Enhanced?sort=semver&style=flat-square&logo=github)](https://github.com/Ajimaru/Sensor-Box-Enhanced/releases/latest)
+[![Release workflow](https://img.shields.io/github/actions/workflow/status/Ajimaru/Sensor-Box-Enhanced/release.yml?style=flat-square&logo=githubactions&logoColor=white&label=release)](https://github.com/Ajimaru/Sensor-Box-Enhanced/actions/workflows/release.yml)
 [![License: CC BY 4.0](https://img.shields.io/badge/license-CC%20BY%204.0-lightgrey?style=flat-square&logo=creativecommons&logoColor=white)](LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/Ajimaru/Sensor-Box-Enhanced?style=flat-square&logo=github)](https://github.com/Ajimaru/Sensor-Box-Enhanced/commits/main)
 [![ESPHome](https://img.shields.io/badge/ESPHome-2026.9-black?style=flat-square&logo=esphome&logoColor=white)](https://esphome.io/)

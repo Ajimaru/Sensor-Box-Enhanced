@@ -15,9 +15,10 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2024.6.1
   name_add_mac_suffix: false
+  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.0.1 -> 0.0.1).
   project:
-    name: AirQuality.Sensor
-    version: dev
+    name: "ajimaru.sensor-box-enhanced"
+    version: "0.0.1"
   # SD card logging helper; must sit next to this YAML on the HA host.
   includes:
     - sd_logger.h
