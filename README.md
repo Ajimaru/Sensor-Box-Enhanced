@@ -4,6 +4,12 @@ ESPHome air quality monitor based on Tom's Sensorbox v2, with extra sensors, a f
 buzzer alarm, SD card logging and optional screen printouts on a thermal printer. It works on its own and
 connects to Home Assistant through the ESPHome API.
 
+[![License: CC BY 4.0](https://img.shields.io/badge/license-CC%20BY%204.0-lightgrey?style=flat-square&logo=creativecommons&logoColor=white)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/Ajimaru/Sensor-Box-Enhanced?style=flat-square&logo=github)](https://github.com/Ajimaru/Sensor-Box-Enhanced/commits/main)
+[![ESPHome](https://img.shields.io/badge/ESPHome-2026.9-black?style=flat-square&logo=esphome&logoColor=white)](https://esphome.io/)
+[![Platform](https://img.shields.io/badge/platform-ESP32--S2-red?style=flat-square&logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s2)
+[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-ESPHome%20API-41bdf5?style=flat-square&logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
+
 ## Based on
 
 - [3D Printer Emission Sensor Array (Sensorbox v2)](https://www.printables.com/model/1079858-3d-printer-emission-sensor-array-sensorbox-v2)
@@ -76,15 +82,34 @@ everything else works as usual.
 
 ## Setup
 
-1. Copy `esphome/secrets.example.yaml` to `secrets.yaml` and fill it in (WiFi, web UI login, API key).
+There is no prebuilt firmware to download. The config uses Bosch BSEC2 for the BME680, whose license doesn't
+allow distributing firmware built with it, and your WiFi password, web UI login and API key are compiled into
+the firmware anyway. You build it yourself with ESPHome from the files in `esphome/`.
+
+1. Copy `esphome/secrets.example.yaml` to `secrets.yaml` and fill it in (WiFi, web UI login, API key). A
+   suitable API key is 32 random bytes in base64, for example from `openssl rand -base64 32`.
 2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h` and `secrets.yaml` in the same folder of your
    ESPHome setup, for example the ESPHome Device Builder in Home Assistant.
 3. In `airquality.yaml`, adjust the time zone under `time:`. The device gets its address by DHCP; for a fixed
    address add a `manual_ip:` block under `wifi:` (or a DHCP reservation in your router).
-4. Flash over USB the first time, then over the air. The settings (alarm limits, backlight, printer) are in
-   the web UI at the device's address; the login is the one from `secrets.yaml`.
+4. Flash the box, see below. The settings (alarm limits, backlight, printer) are in the web UI at the
+   device's address; the login is the one from `secrets.yaml`.
 
 Tested with ESPHome 2026.9.
+
+### Flashing
+
+First time, over USB (the ESP32-S2 has no firmware from this project yet):
+
+1. Connect the main board to the computer with a USB cable. If it isn't detected, hold the BOOT button while
+   plugging it in.
+2. In the Device Builder open the device and choose **Install**. If the Device Builder runs on a different
+   machine than the one the board is plugged into, choose **Manual download** (factory format) and flash the
+   file with [ESPHome Web](https://web.esphome.io/) in Chrome or Edge instead.
+3. The first build takes several minutes.
+
+After that, choose **Install** → **Wirelessly**; no cable needed. If the box can't reach WiFi, it opens a
+fallback access point named like the device and a captive portal to enter new WiFi credentials.
 
 ## License
 
