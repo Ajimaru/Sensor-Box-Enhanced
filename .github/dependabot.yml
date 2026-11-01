@@ -1,5 +1,5 @@
 # Dependabot: once a month, one grouped pull request, minor and major updates only (no patch releases).
-# ESPHome isn't a Dependabot ecosystem, so this covers GitHub Actions workflows (none yet).
+# ESPHome isn't a Dependabot ecosystem, so this covers the GitHub Actions workflows (pinned by commit SHA).
 version: 2
 updates:
   - package-ecosystem: "github-actions"

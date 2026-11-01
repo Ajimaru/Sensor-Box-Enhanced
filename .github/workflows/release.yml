@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package & draft release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Source only, no firmware: the config uses Bosch BSEC2 (private use only, no distribution of firmware
+      # built with it) and the WiFi/API/web UI secrets are compiled into the firmware.
+      - name: Create source zip and Gerber zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          name="sensor-box-enhanced-${version}"
+          mkdir dist
+
+          git archive --format=zip --prefix="${name}/" -o "dist/${name}.zip" HEAD \
+            esphome docs hardware LICENSE README.md SECURITY.md ':!esphome/.gitignore'
+
+          gerber="hardware/enhanced-addon-v0.2/AddonBoard v0.2.zip"
+          if [[ ! -f "$gerber" ]]; then
+            echo "Gerber zip not found: $gerber" >&2
+            exit 1
+          fi
+          cp "$gerber" "dist/addon-board-v0.2-gerber.zip"
+
+          # The config and both headers must be in the source zip, or the release is useless.
+          listing="$(unzip -Z1 "dist/${name}.zip")"
+          for f in airquality.yaml sd_logger.h thermal_print.h secrets.example.yaml; do
+            grep -qx "${name}/esphome/${f}" <<< "$listing" || { echo "Missing in zip: ${f}" >&2; exit 1; }
+          done
+
+          (cd dist && sha256sum -- *.zip > SHA256SUMS.txt)
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/*
+
+      - name: Determine prerelease
+        id: prerelease
+        run: |
+          TAG_LOWER="$(printf '%s' "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]')"
+          # Prerelease = a "-rc1", "-beta.2", "-alpha", "-dev" style suffix after the version number.
+          if echo "$TAG_LOWER" | grep -qE '^v?[0-9]+(\.[0-9]+)*-(a|b|alpha|beta|rc|dev|pre)([.-]?[0-9]+)?$'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: dist/*
+          body: |
+            Source release, **no firmware binaries**: build the firmware yourself with ESPHome, see
+            [Setup](https://github.com/${{ github.repository }}#setup) in the README.
+
+            - `sensor-box-enhanced-*.zip`: ESPHome config, headers, `secrets.example.yaml`, docs and hardware files
+            - `addon-board-v0.2-gerber.zip`: Gerber and drill files of the addon board v0.2 for ordering
+            - `SHA256SUMS.txt`: checksums of both zips
+          # Notes are grouped by PR label; the categories live in .github/release.yml.
+          generate_release_notes: true
+          # Always a draft: a release is published by hand once the notes and the attached files have been
+          # checked. Pushing a tag must never publish on its own.
+          draft: true
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
