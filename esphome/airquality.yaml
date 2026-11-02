@@ -9,6 +9,12 @@ substitutions:
   # QR204 thermal printer bridge (separate project): raw ESC/POS over TCP. The host is set in the web UI
   # ("Printer Host", text entity printer_host).
   printer_port: "9100"
+  # Air filter (air_filter.h): set URL of the filter's fan speed number (web_server REST API, entity name
+  # "Fan Speed"). The filter uses the same web UI login as this box (goes into a C++ string, so no " or \ in
+  # it). The host is set in the web UI ("Filter Host", text entity filter_host).
+  filter_fan_path: "/number/Fan%20Speed/set"
+  filter_user: !secret web_server_username
+  filter_password: !secret web_server_password
 
 esphome:
   name: ${name}
@@ -24,6 +30,8 @@ esphome:
     - sd_logger.h
     # Screen printing on the QR204 thermal printer; must sit next to this YAML on the HA host.
     - thermal_print.h
+    # Air filter control over the filter's REST API; must sit next to this YAML on the HA host.
+    - air_filter.h
   on_boot:
     # SD card (display module J4) on its own SPI bus (SPI3): CLK GPIO35, MOSI GPIO37, MISO GPIO36, CS GPIO38.
     # begin() only starts the sdlog task, which sets up the bus and mounts the card; returns immediately.
@@ -106,6 +114,12 @@ web_server:
     - id: web_group_backlight
       name: "Display Backlight"
       sorting_weight: -8
+    - id: web_group_filter
+      name: "Air Filter"
+      sorting_weight: -7
+    - id: web_group_calibration
+      name: "Calibration"
+      sorting_weight: -6
 
 # Debug
 debug:
@@ -121,6 +135,42 @@ text_sensor:
     web_server:
       sorting_group_id: web_group_printer
       sorting_weight: 2
+
+  # Result of the last request to the air filter (air_filter.h); published by the 1 s interval when it changes.
+  - platform: template
+    name: "Filter Status"
+    id: filter_status
+    icon: "mdi:air-filter"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 3
+
+  # Result of the last "Calibrate ..." press: the new offset per sensor (script calibrate_offsets).
+  - platform: template
+    name: "Calibration Status"
+    id: calibration_status
+    icon: "mdi:tune-variant"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 5
+
+  # Thresholds of fan speeds 1-6 that follow from the "Filter Speed 1/6 above ..." numbers (air_filter.h).
+  - platform: template
+    name: "Filter Steps"
+    id: filter_steps
+    icon: "mdi:stairs"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 5
+    # Also updated when one of the numbers changes.
+    update_interval: 60s
+    lambda: |-
+      return {"PM2.5: " +
+              airfilter::steps_text(id(filter_pm_start).state, id(filter_pm_full).state, "µg/m³") +
+              "; TVOC: " + airfilter::steps_text(id(filter_tvoc_start).state, id(filter_tvoc_full).state, "ppb")};
 
   - platform: template
     name: "SD Card Status"
@@ -262,6 +312,30 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Air filter control (script filter_control): fan speed 0-6 last picked from PM2.5 and from TVOC (-1 = off or no
+  # reading), kept for the hysteresis; the speed last sent and when (millis), for sending on change or every 2 min.
+  - id: filter_speed_pm
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: filter_speed_tvoc
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: filter_sent_speed
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: filter_last_send
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Last airfilter::state seen by the filter status interval; -1 = publish the current state again (set after
+  # each send, so a request that finishes within one poll still updates the status).
+  - id: filter_seen_state
+    type: int
+    restore_value: no
+    initial_value: '-1'
 
 # Printer bridge address (IP or host name, resolved per print by thermal_print.h); kept across reboots.
 text:
@@ -278,6 +352,22 @@ text:
     restore_value: true
     # The bridge gets its address by DHCP and announces itself via mDNS.
     initial_value: "thermal-printer.local"
+    min_length: 1
+    max_length: 64
+
+  # Air filter address (IP or host name, resolved per request by air_filter.h); kept across reboots.
+  - platform: template
+    name: "Filter Host"
+    id: filter_host
+    icon: "mdi:air-filter"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 4
+    mode: text
+    optimistic: true
+    restore_value: true
+    # No default: empty until set in the web UI; nothing is sent until then.
     min_length: 1
     max_length: 64
 
@@ -501,16 +591,131 @@ number:
     restore_value: true
     mode: BOX
 
+  # Air filter control (script filter_control, air_filter.h): per value, fan speed 1 above the first number
+  # and speed 6 above the second; speeds 2-5 lie in between ("Filter Steps" shows them). 0 turns the value off.
+  # The higher speed of PM2.5 and TVOC wins.
+  - platform: template
+    name: "Filter Speed 1 above PM2.5 (0 = off)"
+    id: filter_pm_start
+    icon: "mdi:fan-speed-1"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 11
+    unit_of_measurement: "µg/m³"
+    initial_value: 5
+    min_value: 0
+    max_value: 200
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+    on_value:
+      - component.update: filter_steps
+  - platform: template
+    name: "Filter Speed 6 above PM2.5"
+    id: filter_pm_full
+    icon: "mdi:fan-plus"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 12
+    unit_of_measurement: "µg/m³"
+    initial_value: 50
+    min_value: 0
+    max_value: 200
+    step: 1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+    on_value:
+      - component.update: filter_steps
+  # ENS160 TVOC; defaults from the box's Oct 2026 data (75 % of hours below ~530 ppb, 90 % below ~920 ppb).
+  - platform: template
+    name: "Filter Speed 1 above TVOC (0 = off)"
+    id: filter_tvoc_start
+    icon: "mdi:fan-speed-1"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 13
+    unit_of_measurement: "ppb"
+    initial_value: 500
+    min_value: 0
+    max_value: 10000
+    step: 10
+    optimistic: true
+    restore_value: true
+    mode: BOX
+    on_value:
+      - component.update: filter_steps
+  - platform: template
+    name: "Filter Speed 6 above TVOC"
+    id: filter_tvoc_full
+    icon: "mdi:fan-plus"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 14
+    unit_of_measurement: "ppb"
+    initial_value: 2000
+    min_value: 0
+    max_value: 10000
+    step: 10
+    optimistic: true
+    restore_value: true
+    mode: BOX
+    on_value:
+      - component.update: filter_steps
+
+  # Calibration (script calibrate_offsets): readings of a reference thermometer/hygrometer next to the box; the
+  # "Calibrate ..." buttons set the offsets below so that every sensor reads these values.
+  - platform: template
+    name: "Reference Temperature"
+    id: ref_temperature
+    icon: "mdi:thermometer-check"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 1
+    unit_of_measurement: "°C"
+    initial_value: 21
+    min_value: -10
+    max_value: 50
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+  - platform: template
+    name: "Reference Humidity"
+    id: ref_humidity
+    icon: "mdi:water-check"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 2
+    unit_of_measurement: "%"
+    initial_value: 50
+    min_value: 0
+    max_value: 100
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    mode: BOX
+
   # --- Temperatur-Offsets ---
   - platform: template
     name: "SHT40 Temperature Offset"
     id: temp_sht40_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 10
     unit_of_measurement: "°C"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -521,10 +726,13 @@ number:
     id: temp_scd40_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 11
     unit_of_measurement: "°C"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -535,10 +743,13 @@ number:
     id: temp_aht20_ens_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 12
     unit_of_measurement: "°C"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -549,10 +760,13 @@ number:
     id: temp_bme680_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 13
     unit_of_measurement: "°C"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -564,10 +778,13 @@ number:
     id: hum_sht40_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 14
     unit_of_measurement: "%"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -578,10 +795,13 @@ number:
     id: hum_scd40_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 15
     unit_of_measurement: "%"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -592,10 +812,13 @@ number:
     id: hum_aht20_ens_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 16
     unit_of_measurement: "%"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -606,10 +829,13 @@ number:
     id: hum_bme680_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 17
     unit_of_measurement: "%"
     mode: slider
-    min_value: -20.0
-    max_value: 20.0
+    min_value: -30.0
+    max_value: 30.0
     step: 0.1
     restore_value: true
     optimistic: true
@@ -2036,9 +2262,10 @@ sensor:
             alpha: 0.2
     store_baseline: yes
     update_interval: 36s
-    compensation: 
-      humidity_source: hum_bme680
-      temperature_source: temp_bme680
+    # SHT41: the most accurate temperature/humidity sensor in the box.
+    compensation:
+      humidity_source: hum_sht40
+      temperature_source: temp_sht40
 
   - platform: sgp4x
     i2c_id: i2c_1
@@ -2059,9 +2286,10 @@ sensor:
       device_class: aqi
       state_class: measurement
       unit_of_measurement: "index points"
-    compensation: 
-      humidity_source: hum_bme680
-      temperature_source: temp_bme680
+    # SHT41: the most accurate temperature/humidity sensor in the box.
+    compensation:
+      humidity_source: hum_sht40
+      temperature_source: temp_sht40
     store_baseline: True
     update_interval: 41s
 
@@ -2165,9 +2393,10 @@ sensor:
       name: "ENS160 Air Quality Index"
       id: aqi_ens160
     update_interval: 17s
+    # SHT41: the most accurate temperature/humidity sensor in the box (the AHT21 next to the ENS160 reads its heat).
     compensation:
-      temperature: temp_bme680
-      humidity: hum_bme680
+      temperature: temp_sht40
+      humidity: hum_sht40
 
   # Serial Bus
   - platform: pmsx003
@@ -2185,6 +2414,17 @@ sensor:
       name: "PMS Particulate Matter <10.0µm Concentration"
       id: pm10_pms
 
+  # Fan speed 0-6 that "Filter Auto" sends to the air filter; empty until the first PM2.5 reading.
+  - platform: template
+    name: "Filter Target Speed"
+    id: filter_target_speed
+    icon: "mdi:fan"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 2
+
 # Buzzer with Auto Alert
 switch:
   # Screen print (thermal_print.h): box name and date above the image.
@@ -2198,6 +2438,22 @@ switch:
       sorting_weight: 5
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+  # Air filter control: sets the filter's fan speed from PM2.5 (script filter_control). When off, the fan
+  # keeps its current speed, so the filter can be set by hand.
+  - platform: template
+    name: "Filter Auto"
+    id: filter_auto
+    icon: "mdi:fan-auto"
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 1
+    optimistic: true
+    # Off on first start, so it doesn't fight another controller still running on the filter.
+    restore_mode: RESTORE_DEFAULT_OFF
+    # Send right away, even if the speed hasn't changed.
+    on_turn_on:
+      - lambda: id(filter_sent_speed) = -1;
+      - script.execute: filter_control
   - platform: template
     name: "Buzzer"
     id: buzzer_switch
@@ -2265,6 +2521,29 @@ button:
       sorting_weight: 4
     on_press:
       - lambda: sdlog::request_unmount();
+  # Calibration: set every temperature or humidity offset from the "Reference ..." value (script calibrate_offsets).
+  - platform: template
+    name: "Calibrate Temperature"
+    icon: "mdi:thermometer-check"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 3
+    on_press:
+      - script.execute:
+          id: calibrate_offsets
+          humidity: false
+  - platform: template
+    name: "Calibrate Humidity"
+    icon: "mdi:water-check"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 4
+    on_press:
+      - script.execute:
+          id: calibrate_offsets
+          humidity: true
   # Same as holding the top button for 5 s.
   - platform: template
     name: "Print Screen"
@@ -2294,6 +2573,18 @@ interval:
             id(print_toast) = 0;
             id(display_main).update();
           });
+  # Air filter: fan speed from PM2.5 and TVOC.
+  - interval: 30s
+    then:
+      - script.execute: filter_control
+  # Air filter request status: publish on change.
+  - interval: 1s
+    then:
+      - lambda: |-
+          int state = airfilter::state;
+          if (state == id(filter_seen_state)) return;
+          id(filter_seen_state) = state;
+          id(filter_status).publish_state(airfilter::status_text());
   # SD card log: one CSV row per minute into /sdcard/YYYYMMDD.CSV.
   - interval: 60s
     then:
@@ -2431,6 +2722,87 @@ script:
       - script.wait: print_beep
       - delay: 150ms
       - script.execute: print_beep
+  # Air filter (a separate ESPHome node, set directly over its REST API by air_filter.h, no Home Assistant):
+  # fan speed 0-6 from PM2.5 (PMS) and TVOC (ENS160), the higher of the two; see the "Filter Speed ..." numbers.
+  # Runs every 30 s; while "Filter Auto" is on it sends when the speed changes and every 2 min, so the filter
+  # gets its speed back after a restart. Nothing is sent while both values are off or have no reading (the
+  # ENS160 warms up after each boot).
+  - id: filter_control
+    mode: single
+    then:
+      - lambda: |-
+          id(filter_speed_pm) = airfilter::speed_for(id(filter_speed_pm), id(pm25_pms).state,
+                                                     id(filter_pm_start).state, id(filter_pm_full).state);
+          id(filter_speed_tvoc) = airfilter::speed_for(id(filter_speed_tvoc), id(tvoc_ens160).state,
+                                                       id(filter_tvoc_start).state, id(filter_tvoc_full).state);
+          int speed = std::max(id(filter_speed_pm), id(filter_speed_tvoc));
+          if (speed < 0) return;
+          if (id(filter_target_speed).state != speed) id(filter_target_speed).publish_state(speed);
+          if (!id(filter_auto).state) return;
+          uint32_t now = millis();
+          if (speed == id(filter_sent_speed) && now - id(filter_last_send) < 120000) return;
+          const char *reason = id(filter_speed_tvoc) > id(filter_speed_pm) ? "TVOC" : "PM2.5";
+          if (!airfilter::start(id(filter_host).state, "${filter_fan_path}", speed, reason, "${filter_user}",
+                                "${filter_password}")) {
+            id(filter_seen_state) = -1;
+            return;
+          }
+          id(filter_sent_speed) = speed;
+          id(filter_last_send) = now;
+          id(filter_seen_state) = -1;
+  # Calibration: sets the offset of each temperature (humidity = false) or humidity sensor so that it reads the
+  # "Reference ..." value: offset = reference - last raw reading (before the offset filter), so pressing twice
+  # gives the same result. Rounded to the 0.1 step and kept within the offset's range ("(limit)" in the status).
+  # Takes effect with each sensor's next reading (BME680 every 5 min).
+  - id: calibrate_offsets
+    mode: single
+    parameters:
+      humidity: bool
+    then:
+      - lambda: |-
+          struct Item {
+            const char *name;
+            sensor::Sensor *value;
+            number::Number *offset;
+          };
+          const Item temperatures[] = {
+              {"SHT40", id(temp_sht40), id(temp_sht40_offset)},
+              {"SCD40", id(temp_scd40), id(temp_scd40_offset)},
+              {"AHT20", id(temp_aht20_ens), id(temp_aht20_ens_offset)},
+              {"BME680", id(temp_bme680), id(temp_bme680_offset)},
+          };
+          const Item humidities[] = {
+              {"SHT40", id(hum_sht40), id(hum_sht40_offset)},
+              {"SCD40", id(hum_scd40), id(hum_scd40_offset)},
+              {"AHT20", id(hum_aht20_ens), id(hum_aht20_ens_offset)},
+              {"BME680", id(hum_bme680), id(hum_bme680_offset)},
+          };
+          const Item *items = humidity ? humidities : temperatures;
+          float reference = humidity ? id(ref_humidity).state : id(ref_temperature).state;
+          std::string status = humidity ? "Humidity:" : "Temperature:";
+          char buf[48];
+          for (int i = 0; i < 4; i++) {
+            const Item &item = items[i];
+            float raw = item.value->get_raw_state();
+            if (isnan(raw) || isnan(reference)) {
+              snprintf(buf, sizeof(buf), " %s no reading;", item.name);
+              status += buf;
+              continue;
+            }
+            float old_offset = item.offset->state;
+            float offset = roundf((reference - raw) * 10.0f) / 10.0f;
+            float min_offset = item.offset->traits.get_min_value();
+            float max_offset = item.offset->traits.get_max_value();
+            bool limited = offset < min_offset || offset > max_offset;
+            offset = std::max(min_offset, std::min(max_offset, offset));
+            auto call = item.offset->make_call();
+            call.set_value(offset);
+            call.perform();
+            snprintf(buf, sizeof(buf), " %s %.1f -> %.1f%s;", item.name, old_offset, offset, limited ? " (limit)" : "");
+            status += buf;
+          }
+          ESP_LOGI("calibration", "%s", status.c_str());
+          id(calibration_status).publish_state(status);
   - id: adjust_backlight_based_on_light
     then:
       - lambda: |-

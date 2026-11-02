@@ -42,9 +42,15 @@ Software (`esphome/airquality.yaml`):
 - Buzzer alarm with limits for CO2, CH2O, TVOC and particulate matter, set in the web UI.
 - The display backlight follows presence (PIR) and ambient light, with three levels set in the web UI.
 - Indoor air quality index from the BME680 (Bosch BSEC2).
+- Temperature and humidity offsets per sensor (the sensors sit in the warm case). To calibrate, enter the
+  readings of a reference thermometer/hygrometer next to the box ("Reference Temperature", "Reference
+  Humidity") and press "Calibrate Temperature" or "Calibrate Humidity": the box sets all four offsets so that
+  each sensor reads the reference. The gas sensors (ENS160, SGP30) get their temperature/humidity
+  compensation from the SHT41.
 - Logging to an SD card in the display module's card slot (wired to GPIO35–38): one CSV row per minute, one
   file per day.
 - Optional screen print on a thermal printer, see below.
+- Optional control of an IKEA FÖRNUFTIG air filter converted to ESPHome, by PM2.5 and TVOC, see below.
 
 ## Sensors
 
@@ -72,12 +78,43 @@ is wired to the printer; this bridge is a separate project,
 ("Printer Host", default `thermal-printer.local`) and the print settings are in the web UI. Without a printer
 everything else works as usual.
 
+## Air filter (optional)
+
+The box can set the fan speed of an IKEA FÖRNUFTIG air filter that has been converted to ESPHome (Wemos D1
+mini) with [3ative/ikea-air-filter](https://github.com/3ative/ikea-air-filter). It talks to the filter
+directly over WiFi, through the filter's web server REST API ("Fan Speed", 0–6), so Home Assistant isn't
+needed. That config has no web server; add one with the same login as the box (`type: basic`, because the box
+uses basic authentication and ESPHome switches the default to digest in 2027.1.0):
+
+```yaml
+web_server:
+  port: 80
+  auth:
+    type: basic
+    username: !secret web_server_username
+    password: !secret web_server_password
+```
+
+In the box's web UI, group "Air Filter":
+
+- "Filter Auto" switches the control on. When it is off, the fan keeps its current speed.
+- "Filter Host" is the filter's IP address or host name.
+- PM2.5 (µg/m³) and TVOC from the ENS160 (ppb) each have two values: "Filter Speed 1 above …" and
+  "Filter Speed 6 above …" (defaults 5 / 50 µg/m³ and 500 / 2000 ppb). Speeds 2–5 lie in between and are
+  shown in "Filter Steps". 0 turns a value off. The higher of the two speeds wins.
+- "Filter Status" shows the result of the last request, for example `OK (speed 2, TVOC)`.
+
+The box sends when the speed changes and otherwise every 2 minutes, so the filter gets its speed back after a
+restart. A speed only drops once the value is about 10 % below its threshold. After each boot the ENS160 warms
+up for up to an hour; until then only PM2.5 counts. The filter's activated carbon takes up odours and VOCs, not
+CO2; only fresh air lowers CO2.
+
 ## Repository
 
 | Path | Contents |
 | --- | --- |
 | `esphome/airquality.yaml` | The ESPHome config |
-| `esphome/sd_logger.h`, `esphome/thermal_print.h` | SD card logging and screen printing, included by the config |
+| `esphome/sd_logger.h`, `esphome/thermal_print.h`, `esphome/air_filter.h` | SD card logging, screen printing and air filter control, included by the config |
 | `esphome/secrets.example.yaml` | Template for `secrets.yaml` |
 | `hardware/enhanced-addon-v0.2/` | Addon board v0.2: Gerber and drill files (EasyEDA Pro export, `AddonBoard v0.2.zip` for ordering), a render and the pinout |
 | `docs/` | Sensor capability matrix |
@@ -90,8 +127,8 @@ the firmware anyway. You build it yourself with ESPHome from the files in `espho
 
 1. Copy `esphome/secrets.example.yaml` to `secrets.yaml` and fill it in (WiFi, web UI login, API key). A
    suitable API key is 32 random bytes in base64, for example from `openssl rand -base64 32`.
-2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h` and `secrets.yaml` in the same folder of your
-   ESPHome setup, for example the ESPHome Device Builder in Home Assistant.
+2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h`, `air_filter.h` and `secrets.yaml` in the same
+   folder of your ESPHome setup, for example the ESPHome Device Builder in Home Assistant.
 3. In `airquality.yaml`, adjust the time zone under `time:`. The device gets its address by DHCP; for a fixed
    address add a `manual_ip:` block under `wifi:` (or a DHCP reservation in your router).
 4. Flash the box, see below. The settings (alarm limits, backlight, printer) are in the web UI at the
