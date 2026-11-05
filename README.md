@@ -37,8 +37,14 @@ Hardware:
 
 Software (`esphome/airquality.yaml`):
 
-- Eight display pages: current values, an info page with the alarm limits, 1 h and 24 h graphs (air quality,
-  climate, system) and a QR code that opens the web UI. A short press on the top button shows the next page.
+- Eight display pages: current values, an info page with the alarm limits, the page list and the button
+  controls, 1 h and 24 h graphs (air quality, climate, system) and a QR code that opens the web UI. A short
+  press on the top button shows the next page, holding it for 5 s prints the page, and the box returns to the
+  values page after 30 s without a press. On the values page the top row rotates every 10 s through
+  temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values.
+- Graphs auto-scale where the absolute level matters less (TVOC, particles, light) and keep fixed axes for
+  CO2, temperature, humidity, pressure, dewpoint, heap, PSRAM and loop time; auto-scaled graphs show the unit
+  only, without end labels.
 - Buzzer alarm with limits for CO2, CH2O, TVOC and particulate matter, set in the web UI.
 - The display backlight follows presence (PIR) and ambient light, with three levels set in the web UI.
 - Indoor air quality index from the BME680 (Bosch BSEC2).
