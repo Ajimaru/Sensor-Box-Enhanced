@@ -5,8 +5,6 @@
 esphome/.esphome/
 esphome/secrets.yaml
 
-# Timestamped copies of the HA config (contain the API key)
-backup/
-
 # misc
 backup/
+.ideas/
