@@ -383,7 +383,7 @@ select:
     optimistic: true
     restore_value: true
 
-# Buzzer Alarm, Temperatur and Humidity Offset per Sensor
+# Buzzer alarm, temperature and humidity offsets per sensor
 number:
   # Screen print (thermal_print.h): which colors print black, and the paper feed after the image.
   - platform: template
@@ -490,7 +490,7 @@ number:
     optimistic: true    
     restore_value: true
 
-  # Buzzer Alarm Treshholds
+  # Buzzer alarm thresholds
   - platform: template
     name: "CO2 Alarm Threshold"
     id: co2_alarm_threshold
@@ -1377,9 +1377,15 @@ display:
       int bottom_bar_height = font_height_bottom + bottom_margin_val;
       int footer_start_y = h - bottom_bar_height;
       it.filled_rectangle(0, 0, w, footer_start_y, Color::BLACK);
+      // The top row only exists on the values page: keep the rotation paused while another page shows, so
+      // returning always starts with a full 10 s instead of a random sub-view.
       uint32_t global_current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
-      if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
-        id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+      if (current_main_display_mode == 0) {
+        if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
+          id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+          id(last_top_toggle_time) = global_current_time_ms;
+        }
+      } else {
         id(last_top_toggle_time) = global_current_time_ms;
       }
       int current_top_display_mode = id(top_display_mode_toggle);
@@ -1783,10 +1789,10 @@ display:
         }
       } else if (current_main_display_mode == 1) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 2) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 3) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Info Page");
           float altitude = id(calculated_altitude).state;
@@ -1796,14 +1802,14 @@ display:
               it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f m", altitude);
           }
       } else if (current_main_display_mode == 6) {
-          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Ram CPU");
-          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "RAM CPU");
+          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 4) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 24h");
       } else if (current_main_display_mode == 5) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 24h");
       } else if (current_main_display_mode == 7) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "QR Code");
       }
@@ -2453,7 +2459,7 @@ switch:
       - output.turn_off: buzzer_output
 
   - platform: template
-    name: "Buzzer Alarm Aktiv"
+    name: "Buzzer Alarm"
     id: buzzer_alarm_enable_switch
     entity_category: config
     icon: "mdi:alarm-light"
