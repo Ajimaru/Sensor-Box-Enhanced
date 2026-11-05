@@ -26,5 +26,5 @@ are left out — this only covers the sensor chips themselves.
 ## Notes
 
 - **eCO2** (SGP30, ENS160) is a VOC-based CO2 *estimate*, not a direct CO2 measurement — only the SCD40 measures CO2 directly (NDIR).
-- **SGP41** is configured but not physically populated (SGP30 is installed instead); its columns describe what the chip supports, not what it currently outputs.
+- **SGP41** is configured but not physically populated (SGP30 is installed instead); its columns describe what the chip supports, not what it currently outputs. The `sgp4x` block stays in the config, so each boot logs `Get serial number failed` and marks the component FAILED; its two entities stay unavailable.
 - Several sensors provide more than one bus-native channel not listed as separate columns here (e.g. BME680's gas resistance feeds an IAQ estimate, ENS160's AQI is derived from its own eCO2/TVOC).

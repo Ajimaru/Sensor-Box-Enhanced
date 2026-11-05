@@ -8,7 +8,7 @@ connects to Home Assistant through the ESPHome API.
 [![Release workflow](https://img.shields.io/github/actions/workflow/status/Ajimaru/Sensor-Box-Enhanced/release.yml?style=flat-square&logo=githubactions&logoColor=white&label=release)](https://github.com/Ajimaru/Sensor-Box-Enhanced/actions/workflows/release.yml)
 [![License: CC BY 4.0](https://img.shields.io/badge/license-CC%20BY%204.0-lightgrey?style=flat-square&logo=creativecommons&logoColor=white)](LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/Ajimaru/Sensor-Box-Enhanced?style=flat-square&logo=github)](https://github.com/Ajimaru/Sensor-Box-Enhanced/commits/main)
-[![ESPHome](https://img.shields.io/badge/ESPHome-2026.9-black?style=flat-square&logo=esphome&logoColor=white)](https://esphome.io/)
+[![ESPHome](https://img.shields.io/badge/ESPHome-2026.10-black?style=flat-square&logo=esphome&logoColor=white)](https://esphome.io/)
 [![Platform](https://img.shields.io/badge/platform-ESP32--S2-red?style=flat-square&logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-s2)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-ESPHome%20API-41bdf5?style=flat-square&logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
 
@@ -45,8 +45,9 @@ Software (`esphome/airquality.yaml`):
 - Temperature and humidity offsets per sensor (the sensors sit in the warm case). To calibrate, enter the
   readings of a reference thermometer/hygrometer next to the box ("Reference Temperature", "Reference
   Humidity") and press "Calibrate Temperature" or "Calibrate Humidity": the box sets all four offsets so that
-  each sensor reads the reference. The gas sensors (ENS160, SGP30) get their temperature/humidity
-  compensation from the SHT41.
+  each sensor reads the reference. The SCD40 carries its own 4 °C offset in the chip (ESPHome's default, for
+  self-heating); that correction happens before the box's offset, so the two never add up. The gas sensors
+  (ENS160, SGP30) get their temperature/humidity compensation from the SHT41.
 - Logging to an SD card in the display module's card slot (wired to GPIO35–38): one CSV row per minute, one
   file per day.
 - Optional screen print on a thermal printer, see below.
@@ -66,8 +67,11 @@ Software (`esphome/airquality.yaml`):
 | PMSx003 | PM1, PM2.5, PM10 | UART |
 | SR602 | Motion | GPIO |
 
-The config also supports an SGP41 (VOC and NOx index), which isn't fitted yet. Which sensor feeds which
-value: [docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
+The config also contains an SGP41 block (VOC and NOx index), but no SGP41 is fitted — the SGP30 does that job.
+The block stays for a later upgrade, so every boot logs `Get serial number failed` and
+`sgp4x.sensor is marked FAILED`, and the two SGP41 entities stay unavailable. Comment the block out if you
+don't plan to fit the chip. Which sensor feeds which value:
+[docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
 
 ## Thermal printer (optional)
 
@@ -135,7 +139,7 @@ the firmware anyway. You build it yourself with ESPHome from the files in `espho
 4. Flash the box, see below. The settings (alarm limits, backlight, printer) are in the web UI at the
    device's address; the login is the one from `secrets.yaml`.
 
-Tested with ESPHome 2026.9.
+Tested with ESPHome 2026.10.
 
 ### Flashing
 

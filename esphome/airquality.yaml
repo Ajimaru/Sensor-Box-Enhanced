@@ -90,12 +90,7 @@ wifi:
 
 captive_portal:
 
-# Externe Komponenten
-dashboard_import:
-  package_import_url: github://esphome/firmware/esphome-web/esp32s2.yaml@main
-  import_full_config: true
-
-# Webswerver
+# Web server
 web_server:
   port: 80
   version: 3
@@ -705,8 +700,8 @@ number:
 
   # --- Temperatur-Offsets ---
   - platform: template
-    name: "SHT40 Temperature Offset"
-    id: temp_sht40_offset
+    name: "SHT41 Temperature Offset"
+    id: temp_sht41_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
     web_server:
@@ -739,8 +734,8 @@ number:
     initial_value: 0.0
 
   - platform: template
-    name: "AHT20 ENS160 Temperature Offset"
-    id: temp_aht20_ens_offset
+    name: "AHT21 ENS160 Temperature Offset"
+    id: temp_aht21_ens_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
     web_server:
@@ -774,8 +769,8 @@ number:
 
   # --- Humidity-Offsets ---
   - platform: template
-    name: "SHT40 Humidity Offset"
-    id: hum_sht40_offset
+    name: "SHT41 Humidity Offset"
+    id: hum_sht41_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
     web_server:
@@ -808,8 +803,8 @@ number:
     initial_value: 0.0
 
   - platform: template
-    name: "AHT20 ENS160 Humidity Offset"
-    id: hum_aht20_ens_offset
+    name: "AHT21 ENS160 Humidity Offset"
+    id: hum_aht21_ens_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
     web_server:
@@ -1375,8 +1370,8 @@ display:
         if (light > 2000){col = id(red);}
       }
       auto light_c = col;
-      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
-      float hums[4] = {id(hum_bme680).state, id(hum_sht40).state, id(hum_scd40).state, id(hum_aht20_ens).state};
+      float temps[4] = {id(temp_bme680).state, id(temp_sht41).state, id(temp_scd40).state, id(temp_aht21_ens).state};
+      float hums[4] = {id(hum_bme680).state, id(hum_sht41).state, id(hum_scd40).state, id(hum_aht21_ens).state};
       float temp = NAN;
       float hum = NAN;
       for (float t : temps) { if (!isnan(t)) { temp = t; break; } }
@@ -1969,15 +1964,15 @@ sensor:
           alpha: 0.5
 
   - platform: template
-    name: "SHT40 Dewpoint"
+    name: "SHT41 Dewpoint"
     unit_of_measurement: "°C"
     state_class: measurement
     device_class: temperature
     id: dew_point_sensor
     icon: "mdi:water-thermometer"
     lambda: |-
-      float temperature = id(temp_sht40).state;
-      float humidity = id(hum_sht40).state;
+      float temperature = id(temp_sht41).state;
+      float humidity = id(hum_sht41).state;
       if (isnan(temperature) || isnan(humidity)) {
         return NAN;
       }
@@ -2020,13 +2015,13 @@ sensor:
         t = id(temp_bme680).state;
         rh = id(hum_bme680).state;
       }
-      else if (!isnan(id(temp_sht40).state) && !isnan(id(hum_sht40).state)) {
-        t = id(temp_sht40).state;
-        rh = id(hum_sht40).state;
+      else if (!isnan(id(temp_sht41).state) && !isnan(id(hum_sht41).state)) {
+        t = id(temp_sht41).state;
+        rh = id(hum_sht41).state;
       }
       else {
-        float temps[2] = {id(temp_scd40).state, id(temp_aht20_ens).state};
-        float hums[2] = {id(hum_scd40).state, id(hum_aht20_ens).state};
+        float temps[2] = {id(temp_scd40).state, id(temp_aht21_ens).state};
+        float hums[2] = {id(hum_scd40).state, id(hum_aht21_ens).state};
         for(int i = 0; i < 2; i++) {
           if(!isnan(temps[i]) && !isnan(hums[i])) {
             t = temps[i];
@@ -2049,7 +2044,7 @@ sensor:
     unit_of_measurement: "°C"
     accuracy_decimals: 1
     lambda: |-
-      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
+      float temps[4] = {id(temp_bme680).state, id(temp_sht41).state, id(temp_scd40).state, id(temp_aht21_ens).state};
       float selected_temp = NAN;
       for(int i = 0; i < 4; i++){
         if(!isnan(temps[i])){
@@ -2203,17 +2198,17 @@ sensor:
     address: 0x44
     i2c_id: i2c_1
     temperature:
-      name: "SHT40 Temperature"
-      id: temp_sht40
+      name: "SHT41 Temperature"
+      id: temp_sht41
       icon: "mdi:thermometer"
       filters:
-        - offset: !lambda return id(temp_sht40_offset).state;
+        - offset: !lambda return id(temp_sht41_offset).state;
     humidity:
-      name: "SHT40 Relative Humidity"
-      id: hum_sht40
+      name: "SHT41 Relative Humidity"
+      id: hum_sht41
       icon: "mdi:water-percent"
       filters:
-        - offset: !lambda return id(hum_sht40_offset).state;
+        - offset: !lambda return id(hum_sht41_offset).state;
     precision: High
     update_interval: 79s
 
@@ -2236,6 +2231,9 @@ sensor:
       icon: "mdi:water-percent"
       filters:
         - offset: !lambda return id(hum_scd40_offset).state;
+    # ESPHome's default is 4 °C; the chip applies it before this config's own "SCD40 Temperature Offset"
+    # filter, so the two never stack. Explicit so a default change upstream can't silently shift readings.
+    temperature_offset: 4
     automatic_self_calibration: true
     ambient_pressure_compensation_source: pres_bme680
     update_interval: 33s
@@ -2264,9 +2262,12 @@ sensor:
     update_interval: 36s
     # SHT41: the most accurate temperature/humidity sensor in the box.
     compensation:
-      humidity_source: hum_sht40
-      temperature_source: temp_sht40
+      humidity_source: hum_sht41
+      temperature_source: temp_sht41
 
+  # Not populated in this box: there is no SGP41 at 0x59, so setup logs "Get serial number failed" and the
+  # component is marked FAILED on every boot; both entities stay unavailable. The block is kept for a later
+  # upgrade — comment it out if the chip won't be fitted.
   - platform: sgp4x
     i2c_id: i2c_1
     #address: 0x59
@@ -2288,8 +2289,8 @@ sensor:
       unit_of_measurement: "index points"
     # SHT41: the most accurate temperature/humidity sensor in the box.
     compensation:
-      humidity_source: hum_sht40
-      temperature_source: temp_sht40
+      humidity_source: hum_sht41
+      temperature_source: temp_sht41
     store_baseline: True
     update_interval: 41s
 
@@ -2359,19 +2360,19 @@ sensor:
     i2c_id: i2c_2
     variant: AHT20
     temperature:
-      name: "AHT20 ENS160 Temperature"
-      id: temp_aht20_ens
+      name: "AHT21 ENS160 Temperature"
+      id: temp_aht21_ens
       icon: "mdi:thermometer"
       disabled_by_default: false
       filters:
-        - offset: !lambda return id(temp_aht20_ens_offset).state;
+        - offset: !lambda return id(temp_aht21_ens_offset).state;
     humidity:
-      name: "AHT20 ENS160 Humidity"
-      id: hum_aht20_ens
+      name: "AHT21 ENS160 Humidity"
+      id: hum_aht21_ens
       icon: "mdi:water-percent"
       disabled_by_default: false
       filters:
-        - offset: !lambda return id(hum_aht20_ens_offset).state;
+        - offset: !lambda return id(hum_aht21_ens_offset).state;
     update_interval: 73s
 
   - platform: ens160_i2c
@@ -2395,8 +2396,8 @@ sensor:
     update_interval: 17s
     # SHT41: the most accurate temperature/humidity sensor in the box (the AHT21 next to the ENS160 reads its heat).
     compensation:
-      temperature: temp_sht40
-      humidity: hum_sht40
+      temperature: temp_sht41
+      humidity: hum_sht41
 
   # Serial Bus
   - platform: pmsx003
@@ -2625,10 +2626,10 @@ interval:
           row.num(id(pm10_pms).state, 0);
           row.num(id(ambient_light_ltr390).state, 1);
           row.num(id(uv_index_ltr390).state, 2);
-          row.num(id(temp_sht40).state, 2);
-          row.num(id(hum_sht40).state, 2);
-          row.num(id(temp_aht20_ens).state, 2);
-          row.num(id(hum_aht20_ens).state, 2);
+          row.num(id(temp_sht41).state, 2);
+          row.num(id(hum_sht41).state, 2);
+          row.num(id(temp_aht21_ens).state, 2);
+          row.num(id(hum_aht21_ens).state, 2);
           row.num(id(dew_point_bme680).state, 2);
           row.num(id(dew_point_sensor).state, 2);
           row.num(id(calculated_absolute_humidity).state, 2);
@@ -2766,15 +2767,15 @@ script:
             number::Number *offset;
           };
           const Item temperatures[] = {
-              {"SHT40", id(temp_sht40), id(temp_sht40_offset)},
+              {"SHT41", id(temp_sht41), id(temp_sht41_offset)},
               {"SCD40", id(temp_scd40), id(temp_scd40_offset)},
-              {"AHT20", id(temp_aht20_ens), id(temp_aht20_ens_offset)},
+              {"AHT21", id(temp_aht21_ens), id(temp_aht21_ens_offset)},
               {"BME680", id(temp_bme680), id(temp_bme680_offset)},
           };
           const Item humidities[] = {
-              {"SHT40", id(hum_sht40), id(hum_sht40_offset)},
+              {"SHT41", id(hum_sht41), id(hum_sht41_offset)},
               {"SCD40", id(hum_scd40), id(hum_scd40_offset)},
-              {"AHT20", id(hum_aht20_ens), id(hum_aht20_ens_offset)},
+              {"AHT21", id(hum_aht21_ens), id(hum_aht21_ens_offset)},
               {"BME680", id(hum_bme680), id(hum_bme680_offset)},
           };
           const Item *items = humidity ? humidities : temperatures;
