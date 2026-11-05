@@ -19,7 +19,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2024.6.1
+  min_version: 2026.9.0
   name_add_mac_suffix: false
   # Shown in the device info and the web UI; keep the version in line with the release tag (v0.0.1 -> 0.0.1).
   project:

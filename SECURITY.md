@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-There are no releases. Only the current state of the `main` branch is maintained.
+Only the current state of the `main` branch is maintained. The release tags bundle the ESPHome config, not a firmware image, and come without a support promise.
 
 ## Reporting a vulnerability
 

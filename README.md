@@ -83,8 +83,9 @@ everything else works as usual.
 The box can set the fan speed of an IKEA FÖRNUFTIG air filter that has been converted to ESPHome (Wemos D1
 mini) with [3ative/ikea-air-filter](https://github.com/3ative/ikea-air-filter). It talks to the filter
 directly over WiFi, through the filter's web server REST API ("Fan Speed", 0–6), so Home Assistant isn't
-needed. That config has no web server; add one with the same login as the box (`type: basic`, because the box
-uses basic authentication and ESPHome switches the default to digest in 2027.1.0):
+needed. That config has no web server; add one with the same login as the box. `type: basic` is required: the
+box sends HTTP Basic authentication (`air_filter.h`), and ESPHome switches the default to digest in 2027.1.0,
+so the type must not be left implicit:
 
 ```yaml
 web_server:
