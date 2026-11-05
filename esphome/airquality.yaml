@@ -59,6 +59,8 @@ esp32:
       # SD card logging (sd_logger.h): ESPHome excludes these ESP-IDF components by default.
       include_builtin_idf_components: [fatfs, sdmmc, esp_driver_sdmmc, esp_driver_sdspi, wear_levelling]
       disable_vfs_support_dir: false
+      # Flash is DIO; the generic driver reads every chip, so the vendor drivers can be dropped (saves IRAM).
+      flash_chip: generic
 
 psram:
 
