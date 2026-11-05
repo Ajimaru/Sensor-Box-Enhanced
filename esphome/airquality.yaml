@@ -240,7 +240,27 @@ text_sensor:
         return {"Ready"};
       }
       float warmup = id(ens160_warmup_remaining).state;
-      int remaining = isnan(warmup) ? 60 : (int) warmup;
+      int remaining = isnan(warmup) ? (id(ens160_cold_start) ? 60 : 3) : (int) warmup;
+      if (remaining > 0) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Warming up (up to %d min)", remaining);
+        return {std::string(buf)};
+      }
+      return {"No data"};
+
+  # SGP30 baseline state (12 h learning, then persisted via store_baseline).
+  - platform: template
+    name: "SGP30 Status"
+    icon: "mdi:timer-sand"
+    lambda: |-
+      if (id(sgp30_chip).is_failed()) {
+        return {"Not responding"};
+      }
+      if (id(sgp30_baseline_saved)) {
+        return {"Ready"};
+      }
+      float warmup = id(sgp30_warmup_remaining).state;
+      int remaining = isnan(warmup) ? 720 : (int) warmup;
       if (remaining > 0) {
         char buf[40];
         snprintf(buf, sizeof(buf), "Warming up (up to %d min)", remaining);
@@ -331,6 +351,20 @@ globals:
     type: int
     restore_value: no
     initial_value: '-1'
+  # ENS160 warm-up: the first power-up of a fresh sensor takes an hour, later starts about 3 minutes
+  # (ESPHome docs). Cleared as soon as the chip delivers its first reading; kept in NVS across reboots
+  # and OTA flashes, so only a factory reset or a brand-new chip counts as a cold start again.
+  - id: ens160_cold_start
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # SGP30: Sensirion needs 12 h of continuous operation before the baseline is learned. store_baseline writes
+  # that baseline to flash, so once learned it survives power loss and only a factory reset restarts the wait.
+  - id: sgp30_baseline_saved
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
 
 # Printer bridge address (IP or host name, resolved per print by thermal_print.h); kept across reboots.
 text:
@@ -1115,7 +1149,7 @@ graph:
     height: 51
     color: cyan
     min_value: 400
-    max_value: 2500
+    max_value: 3400
     min_range: 300
     line_type: SOLID
 
@@ -1170,8 +1204,8 @@ graph:
     width: 146
     height: 51
     color: cyan
-    min_value: 0
-    max_value: 15
+    min_value: -10
+    max_value: 25
     min_range: 5
     line_type: SOLID
 
@@ -1231,7 +1265,7 @@ graph:
     height: 51
     color: cyan
     min_value: 400
-    max_value: 2500
+    max_value: 3400
     min_range: 300
     line_type: SOLID
 
@@ -1287,7 +1321,7 @@ graph:
     height: 51
     color: cyan
     min_value: -10
-    max_value: 15
+    max_value: 25
     min_range: 5
     line_type: SOLID
 
@@ -1337,6 +1371,7 @@ display:
       auto co2 = id(co2_scd40).state;
       auto ch2o = id(ch2o_ze08).state;
       auto e_voc = id(tvoc_ens160).state;
+      auto sgp30 = id(tvoc_sgp30).state;
       auto pm1 = id(pm1_pms).state;
       auto pm25 = id(pm25_pms).state;
       auto pm10 = id(pm10_pms).state;
@@ -1351,6 +1386,7 @@ display:
       col = id(white); if (co2 > 800){col = id(yellow);} if (co2 > 1200){col = id(orange);} if (co2 > 1500){col = id(red);} if (co2 > 1800){col = id(purple);} auto co2_c = col;
       col = id(white); if (ch2o > 60){col = id(yellow);} if (ch2o > 100){col = id(orange);} if (ch2o > 150){col = id(red);} if (ch2o > 200){col = id(purple);} auto ch2o_c = col;
       col = id(white); if (e_voc > 400){col = id(yellow);} if (e_voc > 800){col = id(orange);} if (e_voc > 1400){col = id(red);} if (e_voc > 2000){col = id(purple);} auto e_voc_c = col;
+      col = id(white); if (sgp30 > 400){col = id(yellow);} if (sgp30 > 800){col = id(orange);} if (sgp30 > 1400){col = id(red);} if (sgp30 > 2000){col = id(purple);} auto sgp30_c = col;
       col = id(white); if (pm1 > 5){col = id(yellow);} if (pm1 > 10){col = id(orange);} if (pm1 > 15){col = id(red);} if (pm1 > 25){col = id(purple);} auto pm1_c = col;
       col = id(white); if (pm25 > 5){col = id(yellow);} if (pm25 > 10){col = id(orange);} if (pm25 > 15){col = id(red);} if (pm25 > 25){col = id(purple);} auto pm25_c = col;
       col = id(white); if (pm10 > 15){col = id(yellow);} if (pm10 > 45){col = id(orange);} if (pm10 > 60){col = id(red);} if (pm10 > 80){col = id(purple);} auto pm10_c = col;
@@ -1493,7 +1529,6 @@ display:
           }
         }
         auto cy_main = top_section_height + padding_after_top;
-        auto ix = 0;
         auto title = "";
         auto unit = "";
         const char *names[3];
@@ -1510,11 +1545,10 @@ display:
             it.line(0,cy_main,w,cy_main,id(white));
             it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
             it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-            ix = 0;
-            for (int i = 0; i < count; i++){
-              it.printf(w/6*(1+ix*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", names[i]);
-              it.printf(w/6*(1+ix*2), cy_main + 50, fv30, colors[i], display::TextAlign::TOP_CENTER, "%.0f", values[i]);
-              ix++;
+            for (int i = 0; i < count; i++) {
+              int x = 2 + i * (w - 4) / count;
+              it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", names[i]);
+              it.printf(x, cy_main + 50, fv30, colors[i], display::TextAlign::TOP_LEFT, "%.0f", values[i]);
             }
             cy_main += 88;
           }
@@ -1526,18 +1560,20 @@ display:
           it.line(0,cy_main,w,cy_main,id(white));
           it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
           it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-          it.print(w/6, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "SCD40");
-          it.printf(w/6, cy_main + 50, fv30, co2_c, display::TextAlign::TOP_CENTER, "%.0f", co2);
+          it.print(2, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "SCD40");
+          it.printf(2, cy_main + 50, fv30, co2_c, display::TextAlign::TOP_LEFT, "%.0f", co2);
           cy_main += 88;
         }
-        // VOC: ZE08 CH2O, ENS160 TVOC and SGP41 VOC index, left to right in the order they first delivered a
-        // value since boot (the ZE08 is usually first, the ENS160 follows after its warm-up). A column keeps its
-        // place and stays empty if its sensor loses its value; a sensor that never delivers (the SGP41 while it
-        // isn't fitted) gets no column. The SGP41 NOx index sits small above "ppb" and only appears with a value
-        // (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
-        if (!isnan(e_voc) || !isnan(ch2o) || !isnan(aqi_voc) || !isnan(aqi_nox)) {
-          title = "VOC";
-          unit = "ppb";
+        // Gas: ZE08 CH2O (formaldehyde) and ENS160 TVOC in ppb, plus ONE of SGP30 (TVOC, ppb) or SGP41 (VOC
+        // index) — the board has room for only one of the two, so both are configured and the fitted one wins.
+        // Fixed order as listed; a column appears only once its sensor is usable (the SGP30 waits for its
+        // learned baseline, see sgp30_baseline_saved). The SGP41 NOx index sits small above the unit and only
+        // appears with a value (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
+        bool has_sgp41 = !isnan(aqi_voc);
+        bool has_sgp30 = !has_sgp41 && id(sgp30_baseline_saved) && !isnan(sgp30);
+        if (!isnan(ch2o) || !isnan(e_voc) || has_sgp30 || has_sgp41 || !isnan(aqi_nox)) {
+          title = "Gas";
+          unit = has_sgp41 ? "ppb/idx" : "ppb";
           it.line(0,cy_main,w,cy_main,id(white));
           it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
           it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
@@ -1546,22 +1582,18 @@ display:
           if (aqi_voc > 150) { aqi_voc_c = id(orange); }
           if (aqi_voc > 250) { aqi_voc_c = id(red); }
           if (aqi_voc > 350) { aqi_voc_c = id(purple); }
-          const char *voc_names[3] = {"ZE08-CH2O", "ENS160", "SGP41 idx"};
-          float voc_values[3] = {ch2o, e_voc, aqi_voc};
-          esphome::Color voc_colors[3] = {ch2o_c, e_voc_c, aqi_voc_c};
-          static int voc_order[3];  // sensor index per column, filled as sensors deliver their first value
-          static int voc_columns = 0;
-          for (int s = 0; s < 3; s++) {
-            if (isnan(voc_values[s])) continue;
-            bool placed = false;
-            for (int col = 0; col < voc_columns; col++) placed |= voc_order[col] == s;
-            if (!placed) voc_order[voc_columns++] = s;
-          }
-          for (int col = 0; col < voc_columns; col++) {
-            int s = voc_order[col];
-            if (isnan(voc_values[s])) continue;
-            it.printf(w/6*(1+col*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", voc_names[s]);
-            it.printf(w/6*(1+col*2), cy_main + 50, fv30, voc_colors[s], display::TextAlign::TOP_CENTER, "%.0f", voc_values[s]);
+          const char *gas_names[3];
+          float gas_values[3];
+          esphome::Color gas_colors[3];
+          int gas_count = 0;
+          if (!isnan(ch2o)) { gas_names[gas_count] = "ZE08-CH2O"; gas_values[gas_count] = ch2o; gas_colors[gas_count] = ch2o_c; gas_count++; }
+          if (!isnan(e_voc)) { gas_names[gas_count] = "ENS160"; gas_values[gas_count] = e_voc; gas_colors[gas_count] = e_voc_c; gas_count++; }
+          if (has_sgp41) { gas_names[gas_count] = "SGP41 idx"; gas_values[gas_count] = aqi_voc; gas_colors[gas_count] = aqi_voc_c; gas_count++; }
+          else if (has_sgp30) { gas_names[gas_count] = "SGP30"; gas_values[gas_count] = sgp30; gas_colors[gas_count] = sgp30_c; gas_count++; }
+          for (int i = 0; i < gas_count; i++) {
+            int x = 2 + i * (w - 4) / gas_count;
+            it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", gas_names[i]);
+            it.printf(x, cy_main + 50, fv30, gas_colors[i], display::TextAlign::TOP_LEFT, "%.0f", gas_values[i]);
           }
           if(!isnan(aqi_nox)){
             esphome::Color aqi_nox_c = id(white);
@@ -1582,7 +1614,7 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
          it.graph(graph_col_x, graph_y_current, id(voc_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2500);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 3400);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
          it.graph(graph_col_x, graph_y_current, id(co2_graph));
@@ -1618,9 +1650,9 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
          it.graph(graph_col_x, graph_y_current, id(pressure_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 25.0);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", 0.0);
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", -10.0);
          it.graph(graph_col_x, graph_y_current, id(dew_point_graph));
          graph_y_current += graph_height + graph_padding;
          it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx");
@@ -1691,7 +1723,7 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
          it.graph(graph_col_x, graph_y_current, id(voc_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2500);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 3400);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
          it.graph(graph_col_x, graph_y_current, id(co2_graph_24h));
@@ -1727,7 +1759,7 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
          it.graph(graph_col_x, graph_y_current, id(pressure_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 25.0);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", -10.0);
          it.graph(graph_col_x, graph_y_current, id(dew_point_graph_24h));
@@ -1746,7 +1778,7 @@ display:
          auto qr_matrix_size = id(webserver_qr).get_size();
          int max_scale_w = w / qr_matrix_size;
          int max_scale_h = (footer_start_y - (fl14->get_height() + 10)) / qr_matrix_size;
-         int scale = std::min(max_scale_w, max_scale_h);
+         int scale = max_scale_w < max_scale_h ? max_scale_w : max_scale_h;
          if (scale <= 0) scale = 1;
          auto drawn_qr_size = qr_matrix_size * scale;
          int qr_x = (w - drawn_qr_size) / 2;
@@ -2075,11 +2107,36 @@ sensor:
     accuracy_decimals: 0
     update_interval: 10s
     lambda: |-
-      // Upper bound only: the ENS160 publishes as soon as its data is valid.
-      if (id(eco2_ens160).has_state()) return 0;
+      // ESPHome docs: 1 h after the very first power-up, about 3 min after a reboot. The flag is cleared
+      // by the first valid reading, so the upper bound matches whichever case applies.
+      if (id(eco2_ens160).has_state()) {
+        id(ens160_cold_start) = false;
+        return 0;
+      }
+      int limit = id(ens160_cold_start) ? 60 : 3;
       int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
-      if (elapsed_min >= 60) return 0;
-      return 60 - (int) elapsed_min;
+      if (elapsed_min >= limit) return 0;
+      return limit - (int) elapsed_min;
+
+  # 12 h learning time of the SGP30; 0 from the moment the baseline counts as stored.
+  - platform: template
+    name: "SGP30 Warmup Max Remaining"
+    id: sgp30_warmup_remaining
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "min"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(sgp30_baseline_saved)) return 0;
+      // After 12 h of continuous operation the baseline is learned and store_baseline keeps it in flash.
+      if (id(tvoc_sgp30).has_state() && esp_timer_get_time() >= 12LL * 3600LL * 1000000LL) {
+        id(sgp30_baseline_saved) = true;
+        return 0;
+      }
+      int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
+      if (elapsed_min >= 720) return 0;
+      return 720 - (int) elapsed_min;
       
   # Debug Sensors
   - platform: debug
@@ -2200,6 +2257,7 @@ sensor:
     update_interval: 79s
 
   - platform: scd4x
+    id: scd4x_chip
     address: 0x62
     i2c_id: i2c_1
     co2:
@@ -2226,6 +2284,7 @@ sensor:
     update_interval: 33s
 
   - platform: sgp30
+    id: sgp30_chip
     i2c_id: i2c_1
     address: 0x58
     eco2:
@@ -2532,6 +2591,22 @@ button:
       - script.execute:
           id: calibrate_offsets
           humidity: true
+  # SCD40 CO2: forced recalibration against fresh air. Sensirion requires running the sensor in the mode used
+  # later for more than 3 minutes in fresh air (~400-450 ppm) before this; 420 ppm is the current global
+  # monthly mean. Automatic self calibration stays enabled.
+  - platform: template
+    name: "Calibrate SCD40 CO2 (420 ppm)"
+    icon: "mdi:molecule-co2"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 6
+    on_press:
+      - scd4x.perform_forced_calibration:
+          id: scd4x_chip
+          value: 420
+      - lambda: |-
+          id(calibration_status).publish_state("CO2: forced calibration to 420 ppm");
   # Same as holding the top button for 5 s.
   - platform: template
     name: "Print Screen"
@@ -2714,7 +2789,7 @@ script:
   # fan speed 0-6 from PM2.5 (PMS) and TVOC (ENS160), the higher of the two; see the "Filter Speed ..." numbers.
   # Runs every 30 s; while "Filter Auto" is on it sends when the speed changes and every 2 min, so the filter
   # gets its speed back after a restart. Nothing is sent while both values are off or have no reading (the
-  # ENS160 warms up after each boot).
+  # ENS160 warms up after a reboot).
   - id: filter_control
     mode: single
     then:
@@ -2723,7 +2798,7 @@ script:
                                                      id(filter_pm_start).state, id(filter_pm_full).state);
           id(filter_speed_tvoc) = airfilter::speed_for(id(filter_speed_tvoc), id(tvoc_ens160).state,
                                                        id(filter_tvoc_start).state, id(filter_tvoc_full).state);
-          int speed = std::max(id(filter_speed_pm), id(filter_speed_tvoc));
+          int speed = id(filter_speed_pm) > id(filter_speed_tvoc) ? id(filter_speed_pm) : id(filter_speed_tvoc);
           if (speed < 0) return;
           if (id(filter_target_speed).state != speed) id(filter_target_speed).publish_state(speed);
           if (!id(filter_auto).state) return;
@@ -2782,7 +2857,8 @@ script:
             float min_offset = item.offset->traits.get_min_value();
             float max_offset = item.offset->traits.get_max_value();
             bool limited = offset < min_offset || offset > max_offset;
-            offset = std::max(min_offset, std::min(max_offset, offset));
+            if (offset < min_offset) offset = min_offset;
+            if (offset > max_offset) offset = max_offset;
             auto call = item.offset->make_call();
             call.set_value(offset);
             call.perform();

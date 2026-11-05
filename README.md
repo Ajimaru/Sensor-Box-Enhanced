@@ -41,7 +41,10 @@ Software (`esphome/airquality.yaml`):
   controls, 1 h and 24 h graphs (air quality, climate, system) and a QR code that opens the web UI. A short
   press on the top button shows the next page, holding it for 5 s prints the page, and the box returns to the
   values page after 30 s without a press. On the values page the top row rotates every 10 s through
-  temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values.
+  temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values. The
+  gas block shows formaldehyde (ZE08), ENS160 TVOC and whichever VOC sensor is fitted — SGP30 or SGP41, the
+  board has room for one. A value only appears once its sensor delivers usable readings; the SGP41 NOx index
+  would sit small in the corner.
 - Graphs auto-scale where the absolute level matters less (TVOC, particles, light) and keep fixed axes for
   CO2, temperature, humidity, pressure, dewpoint, heap, PSRAM and loop time; auto-scaled graphs show the unit
   only, without end labels.
@@ -53,7 +56,10 @@ Software (`esphome/airquality.yaml`):
   Humidity") and press "Calibrate Temperature" or "Calibrate Humidity": the box sets all four offsets so that
   each sensor reads the reference. The SCD40 carries its own 4 °C offset in the chip (ESPHome's default, for
   self-heating); that correction happens before the box's offset, so the two never add up. The gas sensors
-  (ENS160, SGP30) get their temperature/humidity compensation from the SHT41.
+  (ENS160, SGP30) get their temperature/humidity compensation from the SHT41. The CO2 channel of the SCD40
+  has its own button, "Calibrate SCD40 CO2 (420 ppm)": let the box run in fresh air for a few minutes, then
+  press it to write 420 ppm as the reference (Sensirion forced recalibration; automatic self calibration stays
+  on).
 - Logging to an SD card in the display module's card slot (wired to GPIO35–38): one CSV row per minute, one
   file per day.
 - Optional screen print on a thermal printer, see below.
@@ -116,9 +122,9 @@ In the box's web UI, group "Air Filter":
 - "Filter Status" shows the result of the last request, for example `OK (speed 2, TVOC)`.
 
 The box sends when the speed changes and otherwise every 2 minutes, so the filter gets its speed back after a
-restart. A speed only drops once the value is about 10 % below its threshold. After each boot the ENS160 warms
-up for up to an hour; until then only PM2.5 counts. The filter's activated carbon takes up odours and VOCs, not
-CO2; only fresh air lowers CO2.
+restart. A speed only drops once the value is about 10 % below its threshold. The ENS160 needs about 3
+minutes after a reboot and an hour after its very first power-up; until then only PM2.5 counts. The filter's
+activated carbon takes up odours and VOCs, not CO2; only fresh air lowers CO2.
 
 ## Repository
 
