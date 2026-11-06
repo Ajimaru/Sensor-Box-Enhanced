@@ -1399,6 +1399,9 @@ display:
       swap_xy: false
     color_order: bgr
     invert_colors: false
+    # Keep the full-frame buffer (153600 B, PSRAM). A sliced buffer (buffer_size) does fit internal RAM and
+    # makes the single transfer faster, but the page lambda then runs once per slice: measured 8 x ~21 ms
+    # drawing instead of 48 ms once, and the panel builds up visibly from top to bottom.
     update_interval: 4s
     lambda: |-
       // The page is drawn by draw_screen, which the lambda calls once for the display and, after a print
@@ -1467,7 +1470,8 @@ display:
       int bottom_margin_val = 1;
       int bottom_bar_height = font_height_bottom + bottom_margin_val;
       int footer_start_y = h - bottom_bar_height;
-      it.filled_rectangle(0, 0, w, footer_start_y, Color::BLACK);
+      // No page clear here: the display's auto_clear blackens the buffer before the writer runs, and the
+      // printer canvas is cleared by canvas.clear_bits(). A filled_rectangle over the page cost 58 ms.
       // The top row only exists on the values page: keep the rotation paused while another page shows, so
       // returning always starts with a full 10 s instead of a random sub-view.
       uint32_t global_current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
@@ -1487,7 +1491,6 @@ display:
       int num_graphs_on_most_pages = 5;
       int graph_height = (footer_start_y - graph_y_start - (num_graphs_on_most_pages-1) * graph_padding) / num_graphs_on_most_pages;
       if (current_main_display_mode == 0) {
-        it.filled_rectangle(0, 0, w, top_section_height + padding_after_top, Color::BLACK);
         if (current_top_display_mode == 0) {
           int temp_left_x = 100;
           it.printf(temp_left_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
@@ -1864,7 +1867,6 @@ display:
          it.print(w/2, footer_start_y - 10, fl14, id(grey), TextAlign::BOTTOM_CENTER, "Scan for Webserver");
       }
       int text_baseline_y = h - bottom_margin_val - 4;
-      it.filled_rectangle(0, footer_start_y, w, bottom_bar_height, Color::BLACK);
       int displayed_page_number;
       if (current_main_display_mode == 0) displayed_page_number = 1;
       else if (current_main_display_mode == 3) displayed_page_number = 2;
