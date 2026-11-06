@@ -21,10 +21,10 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2026.9.0
   name_add_mac_suffix: false
-  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.0.1 -> 0.0.1).
+  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.1.0 -> 0.1.0).
   project:
     name: "ajimaru.sensor-box-enhanced"
-    version: "0.0.1"
+    version: "0.1.0"
   # SD card logging helper; must sit next to this YAML on the HA host.
   includes:
     - sd_logger.h
