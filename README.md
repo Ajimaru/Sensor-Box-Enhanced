@@ -40,11 +40,9 @@ Software (`esphome/airquality.yaml`):
 - Eight display pages: current values, an info page with the alarm limits, the page list and the button
   controls, 1 h and 24 h graphs (air quality, climate, system) and a QR code that opens the web UI. A short
   press on the top button shows the next page, holding it for 5 s prints the page, and the box returns to the
-  values page after 30 s without a press. On the values page the top row rotates every 10 s through
-  temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values. The
-  gas block shows formaldehyde (ZE08), ENS160 TVOC and whichever VOC sensor is fitted — SGP30 or SGP41, the
-  board has room for one. A value only appears once its sensor delivers usable readings; the SGP41 NOx index
-  would sit small in the corner.
+  values page after 30 s without a press. On the values page the top row rotates every 10 s through temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values.
+  The gas block shows formaldehyde (ZE08), ENS160 TVOC and whichever VOC sensor is fitted — SGP30 or SGP41, the board has room for one. The particles block is always drawn and shows `--` when the PMS delivers nothing;
+  the other blocks appear once their sensor has usable readings, and the SGP41 NOx index would sit small in the corner.
 - Graphs auto-scale where the absolute level matters less (TVOC, particles, light) and keep fixed axes for
   CO2, temperature, humidity, pressure, dewpoint, heap, PSRAM and loop time; auto-scaled graphs show the unit
   only, without end labels.
@@ -82,8 +80,13 @@ Software (`esphome/airquality.yaml`):
 The config also contains an SGP41 block (VOC and NOx index), but no SGP41 is fitted — the SGP30 does that job.
 The block stays for a later upgrade, so every boot logs `Get serial number failed` and
 `sgp4x.sensor is marked FAILED`, and the two SGP41 entities stay unavailable. Comment the block out if you
-don't plan to fit the chip. Which sensor feeds which value:
-[docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
+don't plan to fit the chip.
+
+The PMSx003 polls every 30 s, so its fan runs continuously. Above 30 s ESPHome puts the sensor to sleep
+between readings; a sleeping PMS survived an ESP reboot and only came back after a mains power cycle, so
+the box keeps it awake and the values page shows `--` if it ever stops delivering.
+
+Which sensor feeds which value: [docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
 
 ## Thermal printer (optional)
 
@@ -91,8 +94,8 @@ Hold the top button for 5 s, or press "Print Screen" in the web UI, to print the
 QR204 thermal printer. The box sends the page over WiFi as ESC/POS (raw TCP, port 9100) to an ESP32-C3 that
 is wired to the printer; this bridge is a separate project,
 [QR204-Printer-Bridge](https://github.com/Ajimaru/QR204-Printer-Bridge). The printer's address
-("Printer Host", default `thermal-printer.local`) and the print settings are in the web UI. Without a printer
-everything else works as usual.
+("Printer Host", default `thermal-printer.local`, the bridge project's own mDNS name) and the print settings
+are in the web UI. Without a printer everything else works as usual.
 
 ## Air filter (optional)
 

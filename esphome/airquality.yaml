@@ -50,6 +50,14 @@ esphome:
       then:
         - delay: 30s
         - script.execute: adjust_backlight_based_on_light
+    # PMS5003 (UART1, GPIO7/8): the sensor keeps its sleep state across an ESP reboot, so a sensor that went
+    # to sleep under the old 120 s firmware stayed silent after the update. Send the documented wake-up and
+    # active-mode frames after every boot; the fan needs ~30 s from sleep before it delivers stable data.
+    # Frames and checksum: PMS5003 manual v2.3, appendix II (check: sum of the first five bytes).
+    - priority: -10
+      then:
+        - delay: 2s
+        - script.execute: pms_wake
 
 esp32:
   board: esp32-s2-saola-1
@@ -230,6 +238,9 @@ text_sensor:
   - platform: template
     name: "ENS160 Status"
     icon: "mdi:timer-sand"
+    # 5 s: the countdown ticks every 10 s, and after it hits zero the first reading still takes one
+    # 17 s cycle. At the 60 s default the status then sat on "No data" while the values were already there.
+    update_interval: 5s
     lambda: |-
       if (id(ens160_chip).is_failed()) {
         return {"Not responding"};
@@ -254,6 +265,7 @@ text_sensor:
   - platform: template
     name: "SGP30 Status"
     icon: "mdi:timer-sand"
+    update_interval: 5s
     lambda: |-
       if (id(sgp30_chip).is_failed()) {
         return {"Not responding"};
@@ -381,7 +393,8 @@ text:
     mode: text
     optimistic: true
     restore_value: true
-    # The bridge gets its address by DHCP and announces itself via mDNS.
+    # The bridge gets its address by DHCP and announces itself via mDNS (default name of the upstream project).
+    # https://github.com/Ajimaru/QR204-Printer-Bridge
     initial_value: "thermal-printer.local"
     min_length: 1
     max_length: 64
@@ -661,7 +674,7 @@ number:
     mode: BOX
     on_value:
       - component.update: filter_steps
-  # ENS160 TVOC; defaults from the box's Oct 2026 data (75 % of hours below ~530 ppb, 90 % below ~920 ppb).
+  # ENS160 TVOC; defaults from the box's own logged data (75 % of hours below ~530 ppb, 90 % below ~920 ppb).
   - platform: template
     name: "Filter Speed 1 above TVOC (0 = off)"
     id: filter_tvoc_start
@@ -1373,7 +1386,12 @@ display:
       auto co2 = id(co2_scd40).state;
       auto ch2o = id(ch2o_ze08).state;
       auto e_voc = id(tvoc_ens160).state;
+      auto eco2_ens = id(eco2_ens160).state;
+      auto eco2_sgp = id(eco2_sgp30).state;
       auto sgp30 = id(tvoc_sgp30).state;
+      // The SGP30 answers 400 ppm / 0 ppb until it has applied its stored baseline a few seconds after a
+      // reboot; hide its columns for the first two minutes so a restart does not show those placeholders.
+      bool sgp30_usable = id(sgp30_baseline_saved) && id(uptime_sensor).state > 120;
       auto pm1 = id(pm1_pms).state;
       auto pm25 = id(pm25_pms).state;
       auto pm10 = id(pm10_pms).state;
@@ -1533,38 +1551,65 @@ display:
         auto cy_main = top_section_height + padding_after_top;
         auto title = "";
         auto unit = "";
-        const char *names[3];
-        float values[3];
-        esphome::Color colors[3];
-        int count = 0;
-        if (!isnan(pm1)){
-          count = 0;
-          if(!isnan(pm1)) {names[count] = "PM1"; values[count] = pm1; colors[count] = pm1_c; count++;}
-          if(!isnan(pm25)) {names[count] = "PM2.5"; values[count] = pm25; colors[count] = pm25_c; count++;}
-          if(!isnan(pm10)) {names[count] = "PM10"; values[count] = pm10; colors[count] = pm10_c; count++;}
-          if (count > 0) {
-            title = "Particles"; unit = "µg/m³";
-            it.line(0,cy_main,w,cy_main,id(white));
-            it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
-            it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-            for (int i = 0; i < count; i++) {
-              int x = 2 + i * (w - 4) / count;
-              it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", names[i]);
-              it.printf(x, cy_main + 50, fv30, colors[i], display::TextAlign::TOP_LEFT, "%.0f", values[i]);
-            }
-            cy_main += 88;
-          }
-        }
-        // CO2: only the SCD40, the one sensor that measures CO2 (the eCO2 values are estimates from VOCs); in the
-        // left column like the first value of the other blocks.
-        if (!isnan(co2)) {
-          title = "CO2"; unit = "ppm";
+        // Particles: always drawn, so a missing PMS reading shows as "--" instead of the block silently
+        // disappearing. The PMS keeps its own state across an ESP reboot and can stay asleep, which left
+        // all three values NA and the page without a particles block.
+        {
+          title = "Particles"; unit = "µg/m³";
           it.line(0,cy_main,w,cy_main,id(white));
           it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
           it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-          it.print(2, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "SCD40");
-          it.printf(2, cy_main + 50, fv30, co2_c, display::TextAlign::TOP_LEFT, "%.0f", co2);
+          const char *pm_names[3] = {"PM1", "PM2.5", "PM10"};
+          float pm_values[3] = {pm1, pm25, pm10};
+          esphome::Color pm_colors[3] = {pm1_c, pm25_c, pm10_c};
+          for (int i = 0; i < 3; i++) {
+            // One third per column, left aligned so every row starts at the same edge.
+            int x = 2 + i * w / 3;
+            it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", pm_names[i]);
+            if (!isnan(pm_values[i])) {
+              it.printf(x, cy_main + 50, fv30, pm_colors[i], display::TextAlign::TOP_LEFT, "%.0f", pm_values[i]);
+            } else {
+              it.print(x, cy_main + 50, fv30, id(grey), display::TextAlign::TOP_LEFT, "--");
+            }
+          }
           cy_main += 88;
+        }
+        // CO2: the SCD40 measures it directly, the ENS160 and SGP30 estimate it from VOCs and sit to the right
+        // under their own "(E)CO2" heading. A column only appears once its sensor has a value; the SGP30 waits
+        // for its learned baseline (sgp30_baseline_saved).
+        {
+          const char *co2_names[3];
+          float co2_values[3];
+          esphome::Color co2_colors[3];
+          int co2_count = 0;
+          bool has_sgp30_eco2 = sgp30_usable && !isnan(eco2_sgp);
+          if (!isnan(co2)) { co2_names[co2_count] = "SCD40"; co2_values[co2_count] = co2; co2_colors[co2_count] = co2_c; co2_count++; }
+          if (!isnan(eco2_ens)) { co2_names[co2_count] = "ENS160"; co2_values[co2_count] = eco2_ens; co2_colors[co2_count] = id(white); co2_count++; }
+          if (has_sgp30_eco2) { co2_names[co2_count] = "SGP30"; co2_values[co2_count] = eco2_sgp; co2_colors[co2_count] = id(white); co2_count++; }
+          if (co2_count > 0) {
+            title = "CO2"; unit = "ppm";
+            it.line(0,cy_main,w,cy_main,id(white));
+            it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+            // 14 px on purpose: the 36 px heading font has no parentheses. The label belongs over the first
+            // estimate column, but "CO2" in Orbitron 36 is ~89 px wide and starts at x = 2, so with three
+            // columns the column edge (x = 82) sits inside the title. Push the label past the title then;
+            // with two columns (x = 122) it stays aligned with the ENS160 column.
+            if (co2_count > 1) {
+              const int title_right = 2 + 89;
+              int est_x = 2 + w / co2_count;
+              if (est_x < title_right + 4)
+                est_x = title_right + 4;
+              it.print(est_x, cy_main + 26, fl14, id(grey), TextAlign::CENTER_LEFT, "(E)CO2");
+            }
+            it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
+            for (int i = 0; i < co2_count; i++) {
+              // Left aligned: sensors start at the left edge and fill to the right as they deliver values.
+              int x = 2 + i * w / co2_count;
+              it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", co2_names[i]);
+              it.printf(x, cy_main + 50, fv30, co2_colors[i], display::TextAlign::TOP_LEFT, "%.0f", co2_values[i]);
+            }
+            cy_main += 88;
+          }
         }
         // Gas: ZE08 CH2O (formaldehyde) and ENS160 TVOC in ppb, plus ONE of SGP30 (TVOC, ppb) or SGP41 (VOC
         // index) — the board has room for only one of the two, so both are configured and the fitted one wins.
@@ -1572,7 +1617,7 @@ display:
         // learned baseline, see sgp30_baseline_saved). The SGP41 NOx index sits small above the unit and only
         // appears with a value (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
         bool has_sgp41 = !isnan(aqi_voc);
-        bool has_sgp30 = !has_sgp41 && id(sgp30_baseline_saved) && !isnan(sgp30);
+        bool has_sgp30 = !has_sgp41 && sgp30_usable && !isnan(sgp30);
         if (!isnan(ch2o) || !isnan(e_voc) || has_sgp30 || has_sgp41 || !isnan(aqi_nox)) {
           title = "Gas";
           unit = has_sgp41 ? "ppb/idx" : "ppb";
@@ -1593,7 +1638,8 @@ display:
           if (has_sgp41) { gas_names[gas_count] = "SGP41 idx"; gas_values[gas_count] = aqi_voc; gas_colors[gas_count] = aqi_voc_c; gas_count++; }
           else if (has_sgp30) { gas_names[gas_count] = "SGP30"; gas_values[gas_count] = sgp30; gas_colors[gas_count] = sgp30_c; gas_count++; }
           for (int i = 0; i < gas_count; i++) {
-            int x = 2 + i * (w - 4) / gas_count;
+            // Left aligned like the other blocks: values appear from the left as sensors come online.
+            int x = 2 + i * w / gas_count;
             it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", gas_names[i]);
             it.printf(x, cy_main + 50, fv30, gas_colors[i], display::TextAlign::TOP_LEFT, "%.0f", gas_values[i]);
           }
@@ -2450,8 +2496,10 @@ sensor:
   # Serial Bus
   - platform: pmsx003
     type: PMSX003
-    # Above 30 s the sensor sleeps between readings and wakes 30 s early: 30 s on, 90 s off.
-    update_interval: 120s
+    # 30 s keeps the fan and laser running continuously. Above 30 s ESPHome sleeps the sensor between
+    # readings and wakes it 30 s early (30 s on, 90 s off at 120 s); the PMS keeps that state across an
+    # ESP reboot and once stayed asleep, with all three values at NA until a mains power cycle.
+    update_interval: 30s
     uart_id: uart_pms
     pm_1_0:
       name: "PMS Particulate Matter <1.0µm Concentration"
@@ -2650,6 +2698,21 @@ interval:
           if (state == id(filter_seen_state)) return;
           id(filter_seen_state) = state;
           id(filter_status).publish_state(airfilter::status_text());
+  # PMS watchdog: while the sensor reports nothing (asleep or wedged) resend the wake-up frames every 5 min.
+  # Once frames arrive the state becomes a number and this stops on its own.
+  # startup_delay: without it the interval fires once right at boot, so the WARN and the extra wake frames
+  # duplicate the on_boot wake-up that already ran two seconds earlier.
+  - interval: 300s
+    startup_delay: 300s
+    then:
+      - if:
+          condition:
+            lambda: return isnan(id(pm1_pms).state);
+          then:
+            - logger.log:
+                level: WARN
+                format: "PMS still silent, resending wake-up frames"
+            - script.execute: pms_wake
   # SD card log: one CSV row per minute into /sdcard/YYYYMMDD.CSV.
   - interval: 60s
     then:
@@ -2747,6 +2810,19 @@ time:
 
 # Scripts
 script:
+  # PMS5003 wake-up and active mode (manual v2.3, appendix II): 42 4D | CMD | DATAH | DATAL | LRC, where LRC
+  # is the sum of the first five bytes. E4 00 01 = wake up, E1 00 01 = active mode (continuous frames).
+  # A sensor that is already awake simply stays awake, so sending this is always safe.
+  - id: pms_wake
+    mode: single
+    then:
+      - uart.write:
+          id: uart_pms
+          data: [0x42, 0x4D, 0xE4, 0x00, 0x01, 0x01, 0x74]
+      - delay: 300ms
+      - uart.write:
+          id: uart_pms
+          data: [0x42, 0x4D, 0xE1, 0x00, 0x01, 0x01, 0x71]
   # Screen print (thermal_print.h): the next display update draws the page into the printer canvas too.
   - id: print_screen
     mode: single
