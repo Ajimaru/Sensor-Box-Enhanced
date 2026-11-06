@@ -378,6 +378,18 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Last valid QNH (sea-level pressure); BSEC has no pressure for the first minutes after a boot, so the
+  # template sensor returns this instead of NaN.
+  - id: last_valid_qnh
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  # Last 3 h pressure tendency in hPa. Restored from flash so the value page does not show "--" for three
+  # hours after a reboot; the sample ring itself is not persisted.
+  - id: last_tendency
+    type: float
+    restore_value: yes
+    initial_value: 'NAN'
   # Air filter control (script filter_control): fan speed 0-6 last picked from PM2.5 and from TVOC (-1 = off or no
   # reading), kept for the hysteresis; the speed last sent and when (millis), for sending on change or every 2 min.
   - id: filter_speed_pm
@@ -562,18 +574,20 @@ number:
     on_value:
       - script.execute: adjust_backlight_based_on_light
 
+  # Height above sea level for the QNH calculation. Taken from a map once — unlike a sea-level pressure it does
+  # not move with the weather, so it can stay as it is.
   - platform: template
-    name: "Manual Sea Level Pressure"
-    id: manual_sea_level_pressure
+    name: "Height Above Sea Level"
+    id: station_height
     entity_category: config
-    unit_of_measurement: "hPa"
-    icon: "mdi:gauge"
-    initial_value: 1014
-    min_value: 950.0
-    max_value: 1050.0
-    step: 0.1
+    unit_of_measurement: "m"
+    icon: "mdi:elevation-rise"
+    initial_value: 0
+    min_value: 0
+    max_value: 2000
+    step: 1
     mode: BOX
-    optimistic: true    
+    optimistic: true
     restore_value: true
 
   # Buzzer alarm thresholds. Only CO2 and particulate matter have a health-based limit, so only they
@@ -1040,7 +1054,7 @@ font:
     size: 30
     bpp: 4
     glyphs: [
-      "0","1","2","3","4","5","6","7","8","9",".",":","-"," ",
+      "0","1","2","3","4","5","6","7","8","9",".",":","-"," ","+",
       "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
       "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
       "µ","³","/","°","%"
@@ -1433,7 +1447,6 @@ display:
       float pressure = id(pres_bme680).state;
       float dew_point = id(dew_point_bme680).state;
       float abs_humidity = id(calculated_absolute_humidity).state;
-      float altitude = id(calculated_altitude).state;
       auto light = id(ambient_light_ltr390).state;
       // Colour steps are anchored to published guideline values (see docs/sensor-capability-matrix.md):
       // CO2 1000 ppm = UBA and ASR A3.6 "ventilate", 2000 ppm = ASR "not acceptable", 3000 ppm far above;
@@ -1507,29 +1520,57 @@ display:
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
         } else if (current_top_display_mode == 1) {
+          // Dew point and absolute humidity describe the same water content, so both use one scale. The steps
+          // are the surface temperatures a heated room normally has: coldest inner surfaces (wall corners, the
+          // area behind furniture) sit at 10-12 °C, and above a dew point of 16 °C the air is sultry and
+          // condenses on almost anything. The g/m3 limits are the saturation densities at those dew points
+          // (9.4 / 10.7 / 13.6 g/m3), see docs/thresholds.md.
+          esphome::Color td_c = id(white);
+          if (dew_point > 10) { td_c = id(yellow); }
+          if (dew_point > 12) { td_c = id(orange); }
+          if (dew_point > 16) { td_c = id(red); }
+          esphome::Color ah_c = id(white);
+          if (abs_humidity < 5) { ah_c = id(grey); }
+          if (abs_humidity > 9.4) { ah_c = id(yellow); }
+          if (abs_humidity > 10.7) { ah_c = id(orange); }
+          if (abs_humidity > 13.6) { ah_c = id(red); }
           it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Td °C");
           if (!isnan(dew_point)) {
-              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", dew_point);
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, td_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", dew_point);
           } else {
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
 
           it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "g/m³");
           if (!isnan(abs_humidity)) {
-              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", abs_humidity);
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, ah_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", abs_humidity);
           } else {
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
         } else if (current_top_display_mode == 2) {
+          // QNH on the left once a height is configured, the plain local reading until then (a height of 0
+          // means "not set"). On the right the 3 h tendency, coloured by magnitude: the sign carries the
+          // direction, the colour says how fast — the steps are the WMO tendency classes.
+          float qnh_value = id(qnh).state;
+          bool has_qnh = !isnan(qnh_value);
+          it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, has_qnh ? "QNH" : "local");
           it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "hPa");
-          if (!isnan(pressure)) {
-              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", pressure);
+          float shown_pressure = has_qnh ? qnh_value : pressure;
+          if (!isnan(shown_pressure)) {
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", shown_pressure);
           } else {
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
-          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "m");
-          if (!isnan(altitude)) {
-              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", altitude);
+          float tendency = id(pressure_tendency).state;
+          float tendency_abs = fabsf(tendency);
+          esphome::Color tend_c = id(white);
+          if (tendency_abs > 0.1) { tend_c = id(yellow); }
+          if (tendency_abs > 1.5) { tend_c = id(orange); }
+          if (tendency_abs > 3.5) { tend_c = id(red); }
+          if (tendency_abs > 6.0) { tend_c = id(purple); }
+          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "hPa/3h");
+          if (!isnan(tendency)) {
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, tend_c, display::TextAlign::BOTTOM_RIGHT, "%+.1f", tendency);
           } else {
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
@@ -1567,17 +1608,20 @@ display:
               it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "AQI");
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
-          // BME680 BSEC2 IAQ (0-500); grey until BSEC2 reports "Calibrating" or "Calibrated".
+          // BME680 BSEC2 IAQ (0-500). The accuracy levels are Stabilizing, Uncertain, Calibrating and
+          // Calibrated; only the last one is a finished calibration, so the value stays grey before that.
+          // Bands from the Bosch scale: 0-50 excellent, 51-100 good, 101-150 moderate, 151-200 unhealthy,
+          // 201-250 very unhealthy, 251-350 severe, 351-500 extreme.
           float iaq = id(iaq_bme680).state;
           const std::string &iaq_acc = id(iaq_accuracy_bme680).state;
-          bool iaq_calibrated = (iaq_acc == "Calibrating" || iaq_acc == "Calibrated");
+          bool iaq_calibrated = (iaq_acc == "Calibrated");
           it.print(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "IAQ");
           if (!isnan(iaq)) {
               esphome::Color iaq_c = id(grey);
               if (iaq_calibrated) {
                 iaq_c = id(white);
-                if (iaq > 300) { iaq_c = id(purple); }
-                else if (iaq > 200) { iaq_c = id(red); }
+                if (iaq > 250) { iaq_c = id(purple); }
+                else if (iaq > 150) { iaq_c = id(red); }
                 else if (iaq > 100) { iaq_c = id(orange); }
                 else if (iaq > 50) { iaq_c = id(yellow); }
               }
@@ -1762,7 +1806,11 @@ display:
          cy_info += fl14->get_height() + 1;
          it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 3 1h RAM / 4 air / 5 climate");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 6 air / 7 climate / 8 QR (24h)");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 6 air / 7 climate 24h / 8 QR");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- top row: 5 views, 10 s each");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- footer: date/IP, 10 s each");
          cy_info += fl14->get_height() + 1;
          it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- press: next page");
          cy_info += fl14->get_height() + 1;
@@ -1906,11 +1954,11 @@ display:
           it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 3) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Info Page");
-          float altitude = id(calculated_altitude).state;
-          if (isnan(altitude)) {
-              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- m");
+          float qnh_value = id(qnh).state;
+          if (isnan(qnh_value)) {
+              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- hPa");
           } else {
-              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f m", altitude);
+              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f hPa", qnh_value);
           }
       } else if (current_main_display_mode == 6) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "RAM CPU");
@@ -2157,30 +2205,52 @@ sensor:
       }
       return selected_temp;
 
+  # QNH — the pressure reduced to sea level, i.e. the value weather reports quote. The local reading alone
+  # says nothing about the weather (the box sits at around 400 m), so this needs the height once. Nothing
+  # depends on it: the SCD40 takes its pressure compensation straight from pres_bme680
+  # (ambient_pressure_compensation_source), because that is the actual ambient pressure.
   - platform: template
-    name: "Calculated Altitude"
-    id: calculated_altitude
-    unit_of_measurement: "m"
+    name: "Sea Level Pressure (QNH)"
+    id: qnh
+    unit_of_measurement: "hPa"
     state_class: "measurement"
-    icon: "mdi:mountain"
-    update_interval: 15min
+    icon: "mdi:gauge"
+    update_interval: 60s
     lambda: |-
-      float local_pressure = NAN;
-      if (id(pres_bme680).has_state()) {
-          local_pressure = id(pres_bme680).state;
+      float local_pressure = id(pres_bme680).state;
+      float local_temperature = id(temp_bme680).state;
+      float height = id(station_height).state;
+      if (!isnan(local_pressure) && !isnan(local_temperature) && !isnan(height) && local_pressure > 0 && height > 0) {
+        // ICAO barometric formula, inverted: the height is known and the height sensor is not needed.
+        id(last_valid_qnh) = local_pressure * pow(1.0 - (0.0065 * height) / (local_temperature + 0.0065 * height + 273.15), -5.257);
       }
-      float local_temperature = NAN;
-      if (id(temp_bme680).has_state()) {
-          local_temperature = id(temp_bme680).state;
+      return id(last_valid_qnh);
+
+  # 3 h pressure tendency, the classic barometer reading: falling means a low is approaching, rising means it
+  # is clearing up. 37 samples at the BSEC rate (5 min) span exactly three hours.
+  - platform: template
+    name: "Pressure Tendency 3h"
+    id: pressure_tendency
+    unit_of_measurement: "hPa/3h"
+    accuracy_decimals: 1
+    state_class: "measurement"
+    icon: "mdi:trending-up"
+    update_interval: 5min
+    lambda: |-
+      static float samples[37];
+      static int count = 0;
+      float local_pressure = id(pres_bme680).state;
+      if (isnan(local_pressure) || local_pressure <= 0) {
+        return id(last_tendency);  // BSEC has no reading yet: keep the last known tendency
       }
-      float sea_level_pressure_ref = id(manual_sea_level_pressure).state;  // Deklaration und Initialisierung
-      if (!isnan(local_pressure) && !isnan(local_temperature) && !isnan(sea_level_pressure_ref)) {
-          if (local_pressure > 0 && sea_level_pressure_ref > 0) {
-              float altitude = (pow(sea_level_pressure_ref / local_pressure, 1.0/5.257) - 1.0) * (local_temperature + 273.15) / 0.0065;
-              return altitude;
-          }
+      int write_index = count % 37;
+      samples[write_index] = local_pressure;
+      count++;
+      if (count > 36) {
+        // The slot after the one just written holds the sample from 36 intervals (= 3 h) ago.
+        id(last_tendency) = local_pressure - samples[(write_index + 1) % 37];
       }
-      return NAN;
+      return id(last_tendency);
 
   - platform: template
     name: "ENS160 Warmup Max Remaining"

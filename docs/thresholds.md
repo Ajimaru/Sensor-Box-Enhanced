@@ -37,6 +37,32 @@ perfume, alcohol or a freshly opened bottle therefore produce large false values
 the offset only shifts the baseline. Winsen also advises against using the module in systems related to human
 safety, which is why CH2O is shown but never allowed to sound the buzzer.
 
+## Further colour steps
+
+These colour a value on the display but never sound the alarm.
+
+| Value | Colour steps (yellow / orange / red / purple) | Basis |
+| --- | --- | --- |
+| AQI (ENS160) | level 2 / 3 / 4 / 5 | The ENS160 reports a five-level index of its own (1 excellent, 2 good, 3 moderate, 4 poor, 5 unhealthy), so every level above "excellent" gets its own colour. |
+| IAQ (BME680, BSEC2) | 50 / 100 / 150 / 250 | Bosch's IAQ scale: 0-50 excellent, 51-100 good, 101-150 moderate, 151-200 unhealthy, 201-250 very unhealthy, above that severe to extreme. The value stays grey until BSEC2 reports `Calibrated`; the levels before that are Stabilizing, Uncertain and Calibrating. |
+| UVI (LTR390) | 3 / 6 / 8 / 11 | WHO UV index: 3 is the top of "moderate", 6 "high", 8 "very high", 11 "extreme". Indoors, behind a window, the value is close to zero most of the time. |
+| Dew point (BME680) | 10 / 12 / 16 °C | The coldest inner surfaces of a heated room — wall corners, the area behind furniture — sit at 10-12 °C. Once the dew point reaches that range, moisture condenses there and mould can grow. Above 16 °C the air is sultry and condenses on almost any surface. |
+| Absolute humidity (BME680) | 5 / 9.4 / 10.7 / 13.6 g/m³ | The same scale as the dew point, because absolute humidity alone determines it: 9.4 / 10.7 / 13.6 g/m³ are the saturation densities at a dew point of 10 / 12 / 16 °C. Below 5 g/m³ the value turns grey — roughly 32 % relative humidity at 21 °C, dry air. The recommended indoor range of 40-50 % RH at 21-22 °C corresponds to 7.3-9.7 g/m³. |
+| Pressure tendency (BME680) | 0.1 / 1.5 / 3.5 / 6.0 hPa per 3 h | The WMO synoptic code for the three-hour pressure tendency: up to 0.1 steady, up to 1.5 a slight rise or fall, up to 3.5 rising or falling, up to 6.0 rapidly, above that very rapidly — the last two are what accompanies a weather change. The sign carries the direction: negative is falling (a low is approaching), positive is rising (it is clearing up). Coloured by magnitude, so a rapid rise is highlighted just like a rapid fall. |
+
+There is no health-based limit for absolute humidity — the g/m³ steps are a building-physics criterion (condensation
+on cold surfaces), not an exposure limit. Note that relative humidity alone says little about mould risk: 60 % in a
+cold room carries more water than 60 % in a warm one, which is why the box judges the dew point and the absolute
+humidity instead.
+
+The pressure view shows QNH — the pressure reduced to sea level, which is the number weather reports quote — once
+"Height Above Sea Level" is set. That height is a constant taken from a map, so unlike a manually entered sea-level
+pressure it does not have to be corrected whenever the weather changes. Until it is set, the view shows the plain
+local reading. Nothing in the firmware depends on the QNH: the SCD40 is compensated with the local pressure
+directly, and the pressure graphs plot the local reading as well. The 3 h tendency needs no reference at all — it
+is the difference to the reading three hours ago, so indoor and outdoor pressure being equal is what makes it a
+weather signal.
+
 ## Air filter control
 
 The fan-speed limits for the optional air filter are control settings rather than health limits: the fan

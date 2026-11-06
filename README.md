@@ -43,7 +43,8 @@ The config is `esphome/airquality.yaml`.
 - Eight display pages: values, an info page with alarm limits, page list and controls, 1 h and 24 h graphs
   (air quality, climate, system) and a QR code for the web UI. Short press = next page, hold 5 s = print,
   30 s without a press = back to the values page. The top row of the values page rotates every 10 s through
-  temperature/humidity, dewpoint/absolute humidity, pressure/altitude, light/UV index and the AQI values.
+  temperature/humidity, dewpoint/absolute humidity, QNH with the 3 h pressure tendency, light/UV index and the
+  AQI values.
 - Values page: particles are always drawn (`--` when the PMS delivers nothing), the gas block shows
   formaldehyde, ENS160 TVOC and whichever VOC sensor is fitted (SGP30 or SGP41 — the board has room for one),
   and every other block appears once its sensor has a reading.
