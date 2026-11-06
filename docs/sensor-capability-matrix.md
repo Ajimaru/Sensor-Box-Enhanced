@@ -32,8 +32,8 @@ are left out — this only covers the sensor chips themselves.
 ## Operating ranges
 
 Taken from the manufacturer datasheets archived in [`hardware/datasheets/`](../hardware/datasheets/)
-(downloaded 2026-11-05; document versions and source URLs are listed there). "Operating" is what the
-datasheet allows at all, "Recommended" is where the accuracy statements hold.
+(document versions and source URLs are listed there). "Operating" is what the datasheet allows at all,
+"Recommended" is where the accuracy statements hold.
 
 | Sensor | Operating temperature | Operating humidity | Recommended / accuracy conditions | Datasheet |
 | --- | --- | --- | --- | --- |
@@ -42,9 +42,9 @@ datasheet allows at all, "Recommended" is where the accuracy statements hold.
 | SGP30 | −40 … +85 °C | 10 … 95 %RH, non-condensing | recommended 5 … 55 °C and 4 … 30 g/m³ absolute humidity | [SGP30 v1.0 D1](../hardware/datasheets/Sensirion_SGP30.pdf) |
 | SGP41 (not fitted) | −20 … +55 °C | 0 … 90 %RH, non-condensing | humidity compensation recommended across the whole range | [SGP41 v1.0](../hardware/datasheets/Sensirion_SGP4x.pdf) |
 | LTR390 | −40 … +85 °C | not specified in the datasheet | — | [LTR-390UV-01](../hardware/datasheets/LiteOn_LTR-390UV.pdf) |
-| AHT21 | not archived | not archived | Aosong publishes no AHT21 file, see [`hardware/datasheets/README.md`](../hardware/datasheets/README.md) | — |
+| AHT21 | −40 … +120 °C | 0 … 100 %RH (best 0 … 80 %) | accuracy ±0.3 °C / ±2 %RH typ at 25 °C; above 80 %RH the reading drifts and recovers slowly | [AHT21 V1.0.03](../hardware/datasheets/Asair_AHT21.pdf) |
 | ENS160 | −40 … +85 °C | 5 … 95 %RH, non-condensing | recommended −5 … +60 °C / 20 … 80 %RH; accuracy at 25 °C / 50 %RH | [ENS160 v1.3](../hardware/datasheets/ScioSense_ENS160.pdf) |
 | BME680 | −40 … +85 °C | 0 … 100 % r.H. | pressure 300 … 1100 hPa | [BST-BME680-DS001-09](../hardware/datasheets/Bosch_BME680.pdf) |
 | ZE08-CH2O | −20 … +50 °C | 15 … 90 %RH, non-condensing | detection 0 … 5 ppm; storage 0 … 25 °C | [ZE08-CH2O v1.7](../hardware/datasheets/Winsen_ZE08-CH2O.pdf) |
-| PMSx003 | not archived | not archived | Plantower blocks automated download, see [`hardware/datasheets/README.md`](../hardware/datasheets/README.md) | — |
-| SR602 | not specified | not specified | generic PIR module, no manufacturer datasheet | — |
+| PMSx003 | −10 … +60 °C | 0 … 99 %RH, non-condensing | 30 s after waking from sleep before the fan delivers stable data | [PMS5003 v2.3](../hardware/datasheets/Plantower_PMS5003.pdf) |
+| SR602 | not specified | not specified | generic PIR module, no manufacturer datasheet; two spare pads take an optional F3 photodiode for day/night | — |
