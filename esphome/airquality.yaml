@@ -6,6 +6,9 @@
 substitutions:
   name: airquality
   friendly_name: Airquality
+  # Single source for the firmware version: the project block (reported to Home Assistant and checked against
+  # the release tag) and the info page footer both use it.
+  version: "0.1.1"
   # QR204 thermal printer bridge (separate project): raw ESC/POS over TCP. The host is set in the web UI
   # ("Printer Host", text entity printer_host).
   printer_port: "9100"
@@ -21,10 +24,10 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2026.9.0
   name_add_mac_suffix: false
-  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.1.0 -> 0.1.0).
+  # Shown in the device info and the web UI; the release workflow compares this with the tag (v0.1.1 -> 0.1.1).
   project:
     name: "ajimaru.sensor-box-enhanced"
-    version: "0.1.0"
+    version: "${version}"
   # SD card logging helper; must sit next to this YAML on the HA host.
   includes:
     - sd_logger.h
@@ -50,14 +53,6 @@ esphome:
       then:
         - delay: 30s
         - script.execute: adjust_backlight_based_on_light
-    # PMS5003 (UART1, GPIO7/8): the sensor keeps its sleep state across an ESP reboot, so a sensor that went
-    # to sleep under the old 120 s firmware stayed silent after the update. Send the documented wake-up and
-    # active-mode frames after every boot; the fan needs ~30 s from sleep before it delivers stable data.
-    # Frames and checksum: PMS5003 manual v2.3, appendix II (check: sum of the first five bytes).
-    - priority: -10
-      then:
-        - delay: 2s
-        - script.execute: pms_wake
 
 esp32:
   board: esp32-s2-saola-1
@@ -1637,8 +1632,8 @@ display:
         auto title = "";
         auto unit = "";
         // Particles: always drawn, so a missing PMS reading shows as "--" instead of the block silently
-        // disappearing. The PMS keeps its own state across an ESP reboot and can stay asleep, which left
-        // all three values NA and the page without a particles block.
+        // disappearing. With the two-minute sleep/wake cycle there is no reading for the first ~30 s after a
+        // boot (the fan has to stabilise), and the block stays in place showing "--" until the first frame.
         {
           title = "Particles"; unit = "µg/m³";
           it.line(0,cy_main,w,cy_main,id(white));
@@ -1801,7 +1796,10 @@ display:
          it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- PM2.5 / PM10 > %.0f / %.0f µg/m³", id(pm25_alarm_threshold).state,
                    id(pm10_alarm_threshold).state);
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "after 5 min, only with Buzzer Alarm on");
+         // Two lines on purpose: as one line the text ran past the right edge (38 characters at 14 px).
+         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "after 5 min,");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "only with Buzzer Alarm on");
          cy_info += fl14->get_height() + 5;
          it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Pages and Controls");
          cy_info += fl18->get_height() + 3;
@@ -1957,12 +1955,9 @@ display:
           it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 3) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Info Page");
-          float qnh_value = id(qnh).state;
-          if (isnan(qnh_value)) {
-              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- hPa");
-          } else {
-              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f hPa", qnh_value);
-          }
+          // Firmware version, from the same substitution as esphome.project.version — ESPHome hands that value
+          // only to the API, not to lambdas, so the text is baked in here.
+          it.print(w - 10, text_baseline_y, fl14, id(light_grey), TextAlign::BOTTOM_RIGHT, "v${version}");
       } else if (current_main_display_mode == 6) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "RAM CPU");
           it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
@@ -2615,10 +2610,11 @@ sensor:
   # Serial Bus
   - platform: pmsx003
     type: PMSX003
-    # 30 s keeps the fan and laser running continuously. Above 30 s ESPHome sleeps the sensor between
-    # readings and wakes it 30 s early (30 s on, 90 s off at 120 s); the PMS keeps that state across an
-    # ESP reboot and once stayed asleep, with all three values at NA until a mains power cycle.
-    update_interval: 30s
+    # 2 min means 30 s on and 90 s off: above 30 s the component runs the sensor in passive mode and sleeps
+    # it between readings (it wakes it 30 s early, because the fan needs that long to stabilise). The laser
+    # is rated for 30000 h of operation, so a 25 % duty cycle turns ~3.5 years into ~14. Below 30 s the fan
+    # would run continuously; the component then also drives the sensor differently (active mode).
+    update_interval: 2min
     uart_id: uart_pms
     pm_1_0:
       name: "PMS Particulate Matter <1.0µm Concentration"
@@ -2864,21 +2860,6 @@ interval:
           if (state == id(filter_seen_state)) return;
           id(filter_seen_state) = state;
           id(filter_status).publish_state(airfilter::status_text());
-  # PMS watchdog: while the sensor reports nothing (asleep or wedged) resend the wake-up frames every 5 min.
-  # Once frames arrive the state becomes a number and this stops on its own.
-  # startup_delay: without it the interval fires once right at boot, so the WARN and the extra wake frames
-  # duplicate the on_boot wake-up that already ran two seconds earlier.
-  - interval: 300s
-    startup_delay: 300s
-    then:
-      - if:
-          condition:
-            lambda: return isnan(id(pm1_pms).state);
-          then:
-            - logger.log:
-                level: WARN
-                format: "PMS still silent, resending wake-up frames"
-            - script.execute: pms_wake
   # SD card log: one CSV row per minute into /sdcard/YYYYMMDD.CSV.
   - interval: 60s
     then:
@@ -2985,19 +2966,6 @@ time:
 
 # Scripts
 script:
-  # PMS5003 wake-up and active mode (manual v2.3, appendix II): 42 4D | CMD | DATAH | DATAL | LRC, where LRC
-  # is the sum of the first five bytes. E4 00 01 = wake up, E1 00 01 = active mode (continuous frames).
-  # A sensor that is already awake simply stays awake, so sending this is always safe.
-  - id: pms_wake
-    mode: single
-    then:
-      - uart.write:
-          id: uart_pms
-          data: [0x42, 0x4D, 0xE4, 0x00, 0x01, 0x01, 0x74]
-      - delay: 300ms
-      - uart.write:
-          id: uart_pms
-          data: [0x42, 0x4D, 0xE1, 0x00, 0x01, 0x01, 0x71]
   # Screen print (thermal_print.h): the next display update draws the page into the printer canvas too.
   - id: print_screen
     mode: single

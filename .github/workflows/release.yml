@@ -46,16 +46,32 @@ jobs:
 
       # The firmware reports esphome.project.version to Home Assistant. A release whose tag disagrees with
       # it would ship a bundle that misreports its own version, so a tag must equal that string
-      # (v0.1.0 -> 0.1.0). Runs on pull requests too, without the comparison, so a change that breaks the
-      # lookup fails before anyone tags.
+      # (v0.1.0 -> 0.1.0). That value may be a substitution reference (${version}) so the config keeps a
+      # single copy of the number; it is resolved from the substitutions block here. Runs on pull requests
+      # too, without the comparison, so a change that breaks the lookup fails before anyone tags.
       - name: Firmware version
         env:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
-          fw="$(awk '/^esphome:/{e=1;next} /^[^ #]/{e=0} e&&/^  project:/{p=1;next} e&&p&&/^  [^ ]/{p=0} e&&p&&/^    version:/{v=$2; gsub(/"/,"",v); print v; exit}' esphome/airquality.yaml)"
+          yaml=esphome/airquality.yaml
+          fw="$(awk '/^esphome:/{e=1;next} /^[^ #]/{e=0} e&&/^  project:/{p=1;next} e&&p&&/^  [^ ]/{p=0} e&&p&&/^    version:/{v=$2; gsub(/"/,"",v); print v; exit}' "$yaml")"
+          case "$fw" in
+            '${'*'}')
+              key="${fw#\$\{}"
+              key="${key%\}}"
+              fw="$(awk -v key="$key" '
+                /^substitutions:/{s=1;next}
+                s&&/^[^ #]/{exit}
+                s&&index($0, "  " key ":")==1{v=$2; gsub(/"/,"",v); print v; exit}' "$yaml")"
+              if [ -z "$fw" ]; then
+                echo "::error::esphome.project.version references \${$key}, but substitutions has no ${key}"
+                exit 1
+              fi
+              ;;
+          esac
           if [ -z "$fw" ]; then
-            echo "::error::no esphome.project.version found in esphome/airquality.yaml"
+            echo "::error::no esphome.project.version found in $yaml"
             exit 1
           fi
           echo "firmware version: $fw"
