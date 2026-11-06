@@ -39,7 +39,7 @@ static const int PRINTER_DOTS = 384;
 static const int ROW_BYTES = PRINTER_DOTS / 8;
 // Largest GS v 0 block in bytes. The printer holds back a block until it has all of it only up to ~1 KB; a larger
 // one starts printing early and then waits for data at 9600 baud, and every stop leaves a white line in dark areas
-// (tested 2026-09-30: 1128-byte blocks got a line, 564-byte blocks printed clean). 12 rows at 1.5x, 14 at 1x.
+// (measured: 1128-byte blocks got a line, 564-byte blocks printed clean). 12 rows at 1.5x, 14 at 1x.
 static const int BAND_BYTES = 576;
 // A pixel prints black when its brightest channel reaches the ink threshold (web UI "Print Ink Threshold").
 // The UI is dark, so the black background becomes paper and everything drawn on it becomes ink; with the
@@ -49,7 +49,7 @@ static const uint8_t DEFAULT_INK_THRESHOLD = 0x40;
 // NUL bytes after the header text. While the printer prints the two header lines, image data piles up; it then
 // prints that backlog at full speed, has to stop abruptly when it runs out, and leaves a white line ~5 mm into
 // the image. With the spacer the backlog is harmless NULs and the image arrives while the printer waits for it
-// (tested 2026-09-30: 1000 bytes still left the line, 2500 didn't). Costs ~3 s per print with the header.
+// (measured: 1000 bytes still left the line, 2500 didn't). Costs ~3 s per print with the header.
 static const int HEADER_SPACER = 3000;
 
 // Per-print settings from the web UI.
@@ -337,7 +337,7 @@ inline bool start(const std::string &host, uint16_t port, const std::string &tit
       b.put(row, row_bytes);
     }
   }
-  // Line feed first: this firmware ignores ESC d right after a raster image (tested 2026-09-30).
+  // Line feed first: this firmware ignores ESC d right after a raster image (measured on this printer).
   b.put({'\n', 0x1B, 'd', opt.feed_lines});  // ESC d: feed past the tear bar
 
   state = SENDING;

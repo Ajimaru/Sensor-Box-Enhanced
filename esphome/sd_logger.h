@@ -9,7 +9,7 @@
 //
 // All card access runs in its own FreeRTOS task ("sdlog"), fed by a small queue. A card that stops
 // answering makes ESP-IDF wait up to 5 s per write (SDMMC_WRITE_CMD_TIMEOUT_MS), which in ESPHome's loop
-// task tripped the 5 s task watchdog (reset on 2026-09-28 ~22:23). The loop task only queues requests and
+// task tripped the 5 s task watchdog and reset the controller. The loop task only queues requests and
 // reads the status; the sdlog task isn't watched by the task watchdog.
 //
 // Used from the YAML: on_boot (begin), a 60 s interval (Row + log_row), template entities (get_status,
