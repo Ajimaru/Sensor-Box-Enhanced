@@ -613,6 +613,7 @@ number:
     id: pm25_alarm_threshold
     entity_category: config
     unit_of_measurement: "µg/m³"
+    icon: "mdi:blur"
     initial_value: 15
     min_value: 0
     max_value: 50
@@ -626,6 +627,7 @@ number:
     id: pm10_alarm_threshold
     entity_category: config
     unit_of_measurement: "µg/m³"
+    icon: "mdi:blur-radial"
     initial_value: 45
     min_value: 0
     max_value: 150
@@ -1505,12 +1507,13 @@ display:
       int graph_height = (footer_start_y - graph_y_start - (num_graphs_on_most_pages-1) * graph_padding) / num_graphs_on_most_pages;
       if (current_main_display_mode == 0) {
         if (current_top_display_mode == 0) {
-          int temp_left_x = 100;
-          it.printf(temp_left_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
+          // Same geometry as every other view: the left value ends at left_col_x, the right one at
+          // right_col_x. A separate 100 px offset here put temperature and humidity too close together.
+          it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
           if (!isnan(temp)) {
-              it.printf(temp_left_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", temp);
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", temp);
           } else {
-              it.print(temp_left_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+              it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
           it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "RH");
           it.print(right_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "\%");
