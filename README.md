@@ -88,9 +88,10 @@ The config also has an SGP41 block (VOC and NOx index) although no SGP41 is fitt
 It stays for a later upgrade, so every boot logs `Get serial number failed` and
 `sgp4x.sensor is marked FAILED`. Comment it out if you don't plan to fit the chip.
 
-The PMSx003 polls every 30 s, so its fan runs continuously. Above 30 s ESPHome sleeps the sensor between
-readings, and a sleeping PMS survived an ESP reboot and only woke again after a mains power cycle — so the
-box keeps it awake and shows `--` if it ever stops delivering.
+The PMSx003 runs in two-minute cycles: the config asks for a reading every 2 min, and above 30 s ESPHome puts
+the sensor to sleep in between and wakes it 30 s early, because the fan needs that long to stabilise. The
+laser is rated for 30 000 h of operation, so this duty cycle turns about 3.5 years of continuous use into
+roughly 14. Readings hold between cycles and `--` only appears until the first frame after a boot.
 
 Which sensor feeds which value: [docs/sensor-capability-matrix.md](docs/sensor-capability-matrix.md).
 
