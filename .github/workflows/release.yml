@@ -72,7 +72,8 @@ jobs:
           if [ "$REF_TYPE" = tag ]; then VERSION="${REF_NAME#v}"; else VERSION="dev-${GITHUB_SHA::7}"; fi
           NAME="Sensor-Box-Enhanced-${VERSION}"
           mkdir -p "dist/$NAME/hardware" "dist/$NAME/docs"
-          cp esphome/airquality.yaml esphome/sd_logger.h esphome/thermal_print.h esphome/secrets.example.yaml "dist/$NAME/"
+          cp esphome/airquality.yaml esphome/sd_logger.h esphome/thermal_print.h esphome/air_filter.h \
+             esphome/secrets.example.yaml "dist/$NAME/"
           cp docs/*.md "dist/$NAME/docs/"
           cp hardware/enhanced-addon-v0.2/README.md "dist/$NAME/hardware/README.md"
           cp "hardware/enhanced-addon-v0.2/AddonBoard v0.2.zip" "dist/$NAME/hardware/addon-board-v0.2-gerber.zip"
@@ -84,8 +85,8 @@ jobs:
           1. Copy `secrets.example.yaml` to `secrets.yaml` and fill in all five values (WiFi SSID and
              password, web UI user and password, API key). Generate the API key with
              `openssl rand -base64 32`.
-          2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h` and `secrets.yaml` in one folder
-             (Home Assistant: `/homeassistant/esphome/`).
+          2. Put `airquality.yaml`, `sd_logger.h`, `thermal_print.h`, `air_filter.h` and `secrets.yaml` in one
+             folder (Home Assistant: `/homeassistant/esphome/`).
           3. In `airquality.yaml`, adjust the time zone under `time:`. The device gets its address by DHCP;
              for a fixed address add a `manual_ip:` block under `wifi:`.
           4. First flash over USB: ESPHome Device Builder -> airquality -> Install -> Plug into this
@@ -106,7 +107,13 @@ jobs:
       - name: Check the bundle installs
         run: |
           python -m pip install --upgrade pip
-          python -m pip install esphome
+          # Pinned to the tested release: an unpinned install could break this check on its own.
+          python -m pip install "esphome~=2026.10.0"
+          # `esphome config` doesn't look at the files in esphome.includes, so a missing header only fails
+          # in the user's build. Compare the list against the bundle instead.
+          for header in $(sed -n '/^  includes:/,/^  [a-z_]/p' esphome/airquality.yaml | sed -n 's/^    - //p' | grep '\.h$'); do
+            test -f "dist/$NAME/$header" || { echo "::error::esphome.includes lists $header, but the bundle has no ${header}"; exit 1; }
+          done
           cd "dist/$NAME"
           sed "s|^api_encryption_key: .*|api_encryption_key: \"$(openssl rand -base64 32)\"|" secrets.example.yaml > secrets.yaml
           esphome config airquality.yaml > /dev/null

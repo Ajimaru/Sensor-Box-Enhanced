@@ -19,12 +19,12 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2024.6.1
+  min_version: 2026.9.0
   name_add_mac_suffix: false
-  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.0.1 -> 0.0.1).
+  # Shown in the device info and the web UI; keep the version in line with the release tag (v0.1.0 -> 0.1.0).
   project:
     name: "ajimaru.sensor-box-enhanced"
-    version: "0.0.1"
+    version: "0.1.0"
   # SD card logging helper; must sit next to this YAML on the HA host.
   includes:
     - sd_logger.h
@@ -50,6 +50,14 @@ esphome:
       then:
         - delay: 30s
         - script.execute: adjust_backlight_based_on_light
+    # PMS5003 (UART1, GPIO7/8): the sensor keeps its sleep state across an ESP reboot, so a sensor that went
+    # to sleep under the old 120 s firmware stayed silent after the update. Send the documented wake-up and
+    # active-mode frames after every boot; the fan needs ~30 s from sleep before it delivers stable data.
+    # Frames and checksum: PMS5003 manual v2.3, appendix II (check: sum of the first five bytes).
+    - priority: -10
+      then:
+        - delay: 2s
+        - script.execute: pms_wake
 
 esp32:
   board: esp32-s2-saola-1
@@ -59,6 +67,8 @@ esp32:
       # SD card logging (sd_logger.h): ESPHome excludes these ESP-IDF components by default.
       include_builtin_idf_components: [fatfs, sdmmc, esp_driver_sdmmc, esp_driver_sdspi, wear_levelling]
       disable_vfs_support_dir: false
+      # Flash is DIO; the generic driver reads every chip, so the vendor drivers can be dropped (saves IRAM).
+      flash_chip: generic
 
 psram:
 
@@ -90,12 +100,7 @@ wifi:
 
 captive_portal:
 
-# Externe Komponenten
-dashboard_import:
-  package_import_url: github://esphome/firmware/esphome-web/esp32s2.yaml@main
-  import_full_config: true
-
-# Webswerver
+# Web server
 web_server:
   port: 80
   version: 3
@@ -233,6 +238,9 @@ text_sensor:
   - platform: template
     name: "ENS160 Status"
     icon: "mdi:timer-sand"
+    # 5 s: the countdown ticks every 10 s, and after it hits zero the first reading still takes one
+    # 17 s cycle. At the 60 s default the status then sat on "No data" while the values were already there.
+    update_interval: 5s
     lambda: |-
       if (id(ens160_chip).is_failed()) {
         return {"Not responding"};
@@ -245,13 +253,65 @@ text_sensor:
         return {"Ready"};
       }
       float warmup = id(ens160_warmup_remaining).state;
-      int remaining = isnan(warmup) ? 60 : (int) warmup;
+      int remaining = isnan(warmup) ? (id(ens160_cold_start) ? 60 : 3) : (int) warmup;
       if (remaining > 0) {
         char buf[40];
         snprintf(buf, sizeof(buf), "Warming up (up to %d min)", remaining);
         return {std::string(buf)};
       }
       return {"No data"};
+
+  # SGP30 baseline state (12 h learning, then persisted via store_baseline).
+  - platform: template
+    name: "SGP30 Status"
+    icon: "mdi:timer-sand"
+    update_interval: 5s
+    lambda: |-
+      if (id(sgp30_chip).is_failed()) {
+        return {"Not responding"};
+      }
+      if (id(sgp30_baseline_saved)) {
+        return {"Ready"};
+      }
+      float warmup = id(sgp30_warmup_remaining).state;
+      int remaining = isnan(warmup) ? 720 : (int) warmup;
+      if (remaining > 0) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Warming up (up to %d min)", remaining);
+        return {std::string(buf)};
+      }
+      return {"No data"};
+
+  # Countdown for the SGP30 baseline. Sensirion requires 12 h of uninterrupted operation before the baseline
+  # is learned and ESPHome can store it; every reboot, flash and power cut restarts that window, so this
+  # counts the current uptime and shows when it will be done. Nothing to press: it starts at boot by itself.
+  - platform: template
+    name: "SGP30 Baseline Timer"
+    id: sgp30_baseline_timer
+    icon: "mdi:timer-sand-complete"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 20
+    update_interval: 30s
+    lambda: |-
+      const int64_t need_s = 12LL * 3600LL;
+      int64_t up_s = esp_timer_get_time() / 1000000LL;
+      char buf[64];
+      if (up_s >= need_s) {
+        return std::string("complete - baseline stored in flash");
+      }
+      int64_t left_s = need_s - up_s;
+      auto now = id(esptime).now();
+      if (now.is_valid()) {
+        auto ready = esphome::ESPTime::from_epoch_local((time_t) now.timestamp + (time_t) left_s);
+        snprintf(buf, sizeof(buf), "%lld h %02lld min left, ready %02d:%02d", (long long) (left_s / 3600),
+                 (long long) ((left_s % 3600) / 60), ready.hour, ready.minute);
+      } else {
+        snprintf(buf, sizeof(buf), "%lld h %02lld min left", (long long) (left_s / 3600),
+                 (long long) ((left_s % 3600) / 60));
+      }
+      return std::string(buf);
 
 # QR Code generator
 qr_code:
@@ -296,6 +356,12 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
+  # Buzzer alarm: millis() when a limit was first exceeded, 0 = no limit exceeded. The alarm only sounds
+  # after the condition held for 5 min, so a candle, a dust burst or a cooking spike does not trigger it.
+  - id: alarm_above_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # Set by the print_screen script; the next display update also draws the page for the printer.
   - id: print_requested
     type: bool
@@ -312,6 +378,18 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Last valid QNH (sea-level pressure); BSEC has no pressure for the first minutes after a boot, so the
+  # template sensor returns this instead of NaN.
+  - id: last_valid_qnh
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  # Last 3 h pressure tendency in hPa. Restored from flash so the value page does not show "--" for three
+  # hours after a reboot; the sample ring itself is not persisted.
+  - id: last_tendency
+    type: float
+    restore_value: yes
+    initial_value: 'NAN'
   # Air filter control (script filter_control): fan speed 0-6 last picked from PM2.5 and from TVOC (-1 = off or no
   # reading), kept for the hysteresis; the speed last sent and when (millis), for sending on change or every 2 min.
   - id: filter_speed_pm
@@ -336,6 +414,20 @@ globals:
     type: int
     restore_value: no
     initial_value: '-1'
+  # ENS160 warm-up: the first power-up of a fresh sensor takes an hour, later starts about 3 minutes
+  # (ESPHome docs). Cleared as soon as the chip delivers its first reading; kept in NVS across reboots
+  # and OTA flashes, so only a factory reset or a brand-new chip counts as a cold start again.
+  - id: ens160_cold_start
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  # SGP30: Sensirion needs 12 h of continuous operation before the baseline is learned. store_baseline writes
+  # that baseline to flash, so once learned it survives power loss and only a factory reset restarts the wait.
+  - id: sgp30_baseline_saved
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
 
 # Printer bridge address (IP or host name, resolved per print by thermal_print.h); kept across reboots.
 text:
@@ -350,7 +442,8 @@ text:
     mode: text
     optimistic: true
     restore_value: true
-    # The bridge gets its address by DHCP and announces itself via mDNS.
+    # The bridge gets its address by DHCP and announces itself via mDNS (default name of the upstream project).
+    # https://github.com/Ajimaru/QR204-Printer-Bridge
     initial_value: "thermal-printer.local"
     min_length: 1
     max_length: 64
@@ -388,7 +481,7 @@ select:
     optimistic: true
     restore_value: true
 
-# Buzzer Alarm, Temperatur and Humidity Offset per Sensor
+# Buzzer alarm, temperature and humidity offsets per sensor
 number:
   # Screen print (thermal_print.h): which colors print black, and the paper feed after the image.
   - platform: template
@@ -481,85 +574,35 @@ number:
     on_value:
       - script.execute: adjust_backlight_based_on_light
 
+  # Height above sea level for the QNH calculation. Taken from a map once — unlike a sea-level pressure it does
+  # not move with the weather, so it can stay as it is.
   - platform: template
-    name: "Manual Sea Level Pressure"
-    id: manual_sea_level_pressure
+    name: "Height Above Sea Level"
+    id: station_height
     entity_category: config
-    unit_of_measurement: "hPa"
-    icon: "mdi:gauge"
-    initial_value: 1014
-    min_value: 950.0
-    max_value: 1050.0
-    step: 0.1
+    unit_of_measurement: "m"
+    icon: "mdi:elevation-rise"
+    initial_value: 0
+    min_value: 0
+    max_value: 2000
+    step: 1
     mode: BOX
-    optimistic: true    
+    optimistic: true
     restore_value: true
 
-  # Buzzer Alarm Treshholds
+  # Buzzer alarm thresholds. Only CO2 and particulate matter have a health-based limit, so only they
+  # drive the buzzer; CH2O and TVOC are shown on the display but never sound the alarm (CH2O because the
+  # ZE08 drifts and reads a fixed offset, TVOC because it is a sum parameter without a limit).
+  # A limit must hold for 5 minutes before the alarm sounds (see the 10 s interval below).
   - platform: template
     name: "CO2 Alarm Threshold"
     id: co2_alarm_threshold
     entity_category: config
     unit_of_measurement: "ppm"
     icon: "mdi:molecule-co2"
-    initial_value: 1500
+    initial_value: 2000
     min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "CH2O Alarm Threshold"
-    id: ch2o_alarm_threshold
-    entity_category: config
-    icon: "mdi:gas-cylinder"
-    unit_of_measurement: "ppb"
-    initial_value: 200
-    min_value: 0
-    max_value: 1000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "TVOC Alarm Threshold (ENS160)"
-    id: tvoc_alarm_threshold_ens
-    entity_category: config
-    icon: "mdi:radiator"
-    unit_of_measurement: "ppb"
-    initial_value: 1400
-    min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "TVOC Alarm Threshold (SGP30)"
-    id: tvoc_alarm_threshold_sgp30
-    entity_category: config
-    icon: "mdi:radiator"
-    unit_of_measurement: "ppb"
-    initial_value: 1000
-    min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "PM1 Alarm Threshold"
-    id: pm1_alarm_threshold
-    entity_category: config
-    unit_of_measurement: "µg/m³"
-    initial_value: 15
-    min_value: 0
-    max_value: 50
+    max_value: 5000
     step: 1
     optimistic: true
     restore_value: true
@@ -570,6 +613,7 @@ number:
     id: pm25_alarm_threshold
     entity_category: config
     unit_of_measurement: "µg/m³"
+    icon: "mdi:blur"
     initial_value: 15
     min_value: 0
     max_value: 50
@@ -583,9 +627,10 @@ number:
     id: pm10_alarm_threshold
     entity_category: config
     unit_of_measurement: "µg/m³"
-    initial_value: 30
+    icon: "mdi:blur-radial"
+    initial_value: 45
     min_value: 0
-    max_value: 100
+    max_value: 150
     step: 1
     optimistic: true
     restore_value: true
@@ -594,6 +639,10 @@ number:
   # Air filter control (script filter_control, air_filter.h): per value, fan speed 1 above the first number
   # and speed 6 above the second; speeds 2-5 lie in between ("Filter Steps" shows them). 0 turns the value off.
   # The higher speed of PM2.5 and TVOC wins.
+  # These are control settings, not health limits: the fan starts one colour step before the display warns
+  # (PM2.5 10 below the yellow 15, TVOC 800 = orange) and runs at full speed from the red / purple step on.
+  # Changing initial_value does NOT change a running box — the values are restored from flash, so set them
+  # once in the web UI (or via the number API).
   - platform: template
     name: "Filter Speed 1 above PM2.5 (0 = off)"
     id: filter_pm_start
@@ -603,7 +652,7 @@ number:
       sorting_group_id: web_group_filter
       sorting_weight: 11
     unit_of_measurement: "µg/m³"
-    initial_value: 5
+    initial_value: 10
     min_value: 0
     max_value: 200
     step: 1
@@ -630,7 +679,8 @@ number:
     mode: BOX
     on_value:
       - component.update: filter_steps
-  # ENS160 TVOC; defaults from the box's Oct 2026 data (75 % of hours below ~530 ppb, 90 % below ~920 ppb).
+  # ENS160 TVOC; = the display's orange step. TVOC has no absolute limit, so the band sits above the room's own
+  # baseline (75 % of hours below ~530 ppb) instead of starting the fan permanently.
   - platform: template
     name: "Filter Speed 1 above TVOC (0 = off)"
     id: filter_tvoc_start
@@ -640,7 +690,7 @@ number:
       sorting_group_id: web_group_filter
       sorting_weight: 13
     unit_of_measurement: "ppb"
-    initial_value: 500
+    initial_value: 800
     min_value: 0
     max_value: 10000
     step: 10
@@ -705,8 +755,8 @@ number:
 
   # --- Temperatur-Offsets ---
   - platform: template
-    name: "SHT40 Temperature Offset"
-    id: temp_sht40_offset
+    name: "SHT41 Temperature Offset"
+    id: temp_sht41_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
     web_server:
@@ -739,8 +789,8 @@ number:
     initial_value: 0.0
 
   - platform: template
-    name: "AHT20 ENS160 Temperature Offset"
-    id: temp_aht20_ens_offset
+    name: "AHT21 ENS160 Temperature Offset"
+    id: temp_aht21_ens_offset
     icon: "mdi:thermometer-plus"
     entity_category: config
     web_server:
@@ -774,8 +824,8 @@ number:
 
   # --- Humidity-Offsets ---
   - platform: template
-    name: "SHT40 Humidity Offset"
-    id: hum_sht40_offset
+    name: "SHT41 Humidity Offset"
+    id: hum_sht41_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
     web_server:
@@ -808,8 +858,8 @@ number:
     initial_value: 0.0
 
   - platform: template
-    name: "AHT20 ENS160 Humidity Offset"
-    id: hum_aht20_ens_offset
+    name: "AHT21 ENS160 Humidity Offset"
+    id: hum_aht21_ens_offset
     icon: "mdi:water-percent-alert"
     entity_category: config
     web_server:
@@ -837,6 +887,45 @@ number:
     min_value: -30.0
     max_value: 30.0
     step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  # LTR390 window correction (datasheet: "WFAC", >1 for a tinted window in front of the sensor). This box
+  # runs the sensor without tinted glass, so it stays 1.0; raise it when the case gets a tinted cover. Applied
+  # as a multiplier on lux and UV index, exactly what the datasheet formula does.
+  - platform: template
+    name: "LTR390 Window Correction"
+    id: ltr_wfac
+    icon: "mdi:brightness-6"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 19
+    mode: BOX
+    min_value: 1.0
+    max_value: 4.0
+    step: 0.05
+    restore_value: true
+    optimistic: true
+    initial_value: 1.0
+
+  # Subtracted from the raw ZE08-CH2O reading. The datasheet has no accuracy figure and the protocol no
+  # zero-point command, so this is a relative calibration: zero it in fresh air with the button below (or
+  # enter a value by hand).
+  - platform: template
+    name: "CH2O Offset"
+    id: ch2o_offset
+    icon: "mdi:gas-cylinder"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 18
+    unit_of_measurement: "ppb"
+    mode: BOX
+    min_value: -200.0
+    max_value: 200.0
+    step: 1.0
     restore_value: true
     optimistic: true
     initial_value: 0.0
@@ -967,7 +1056,7 @@ font:
     size: 30
     bpp: 4
     glyphs: [
-      "0","1","2","3","4","5","6","7","8","9",".",":","-"," ",
+      "0","1","2","3","4","5","6","7","8","9",".",":","-"," ","+",
       "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
       "A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
       "µ","³","/","°","%"
@@ -1021,8 +1110,10 @@ color:
     hex: 00FFFF
 
 # history graph
-# ESPHome uses min_range as the y-axis step: it must divide min_value and max_value evenly
-# and give at most 10 steps, otherwise it logs "reducing y-scale" and stretches the axis.
+# Fixed graphs use min_range as the y-axis step: it must divide (max_value - min_value) evenly and give at
+# most 10 steps, otherwise ESPHome logs "reducing y-scale" and stretches the axis.
+# Graphs without min_value/max_value auto-range to the data, bounded by min_range (smallest visible window)
+# and max_range (ceiling against spikes); their labels therefore show the unit only.
 # x_grid must give at most 20 divisions per duration ("reducing x-scale").
 graph:
   # --- 1h graph ---
@@ -1034,8 +1125,8 @@ graph:
     height: 51
     color: blue
     min_value: 0
-    max_value: 350
-    min_range: 50
+    max_value: 100
+    min_range: 20
     line_type: SOLID
 
   - id: heap_max_block_graph_1h
@@ -1046,8 +1137,8 @@ graph:
     height: 51
     color: cyan
     min_value: 0
-    max_value: 100
-    min_range: 20
+    max_value: 64
+    min_range: 16
     line_type: SOLID
 
   - id: free_psram_graph_1h
@@ -1057,9 +1148,9 @@ graph:
     width: 146
     height: 51
     color: magenta
-    min_value: 0
+    min_value: 1700
     max_value: 2000
-    min_range: 250
+    min_range: 50
     line_type: SOLID
 
   - id: loop_time_graph_1h
@@ -1069,8 +1160,8 @@ graph:
     width: 146
     height: 51
     color: magenta
-    min_value: 0
-    max_value: 350
+    min_value: 100
+    max_value: 250
     min_range: 50
     line_type: SOLID
 
@@ -1118,8 +1209,8 @@ graph:
     height: 51
     color: cyan
     min_value: 400
-    max_value: 2000
-    min_range: 200
+    max_value: 3400
+    min_range: 300
     line_type: SOLID
 
   - id: voc_graph
@@ -1129,9 +1220,8 @@ graph:
     width: 146
     height: 51
     color: orange
-    min_value: 0
-    max_value: 600
-    min_range: 100
+    min_range: 200
+    max_range: 3000
     line_type: SOLID
 
   - id: pm1_graph
@@ -1141,9 +1231,8 @@ graph:
     width: 146
     height: 51
     color: orange
-    min_value: 0
-    max_value: 15
-    min_range: 5
+    min_range: 4
+    max_range: 100
     line_type: SOLID
 
   - id: pm10_graph
@@ -1153,9 +1242,8 @@ graph:
     width: 146
     height: 51
     color: green
-    min_value: 0
-    max_value: 55
-    min_range: 11
+    min_range: 20
+    max_range: 200
     line_type: SOLID
 
   - id: pm25_graph
@@ -1165,9 +1253,8 @@ graph:
     width: 146
     height: 51
     color: purple
-    min_value: 0
-    max_value: 30
-    min_range: 5
+    min_range: 10
+    max_range: 200
     line_type: SOLID
 
   - id: dew_point_graph
@@ -1177,8 +1264,8 @@ graph:
     width: 146
     height: 51
     color: cyan
-    min_value: 0
-    max_value: 15
+    min_value: -10
+    max_value: 25
     min_range: 5
     line_type: SOLID
 
@@ -1189,9 +1276,8 @@ graph:
     width: 146
     height: 51
     color: yellow
-    min_value: 0
-    max_value: 2000
-    min_range: 500
+    min_range: 100
+    max_range: 20000
     line_type: SOLID
 
   # --- 24h graph ---
@@ -1239,8 +1325,8 @@ graph:
     height: 51
     color: cyan
     min_value: 400
-    max_value: 2000
-    min_range: 200
+    max_value: 3400
+    min_range: 300
     line_type: SOLID
 
   - id: voc_graph_24h
@@ -1250,9 +1336,8 @@ graph:
     width: 146
     height: 51
     color: orange
-    min_value: 0
-    max_value: 600
-    min_range: 100
+    min_range: 200
+    max_range: 3000
     line_type: SOLID
 
   - id: pm1_graph_24h
@@ -1262,9 +1347,8 @@ graph:
     width: 146
     height: 51
     color: orange
-    min_value: 0
-    max_value: 15
-    min_range: 5
+    min_range: 4
+    max_range: 100
     line_type: SOLID
 
   - id: pm25_graph_24h
@@ -1274,9 +1358,8 @@ graph:
     width: 146
     height: 51
     color: purple
-    min_value: 0
-    max_value: 30
-    min_range: 5
+    min_range: 10
+    max_range: 200
     line_type: SOLID
 
   - id: pm10_graph_24h
@@ -1286,9 +1369,8 @@ graph:
     width: 146
     height: 51
     color: green
-    min_value: 0
-    max_value: 55
-    min_range: 11
+    min_range: 20
+    max_range: 200
     line_type: SOLID
 
   - id: dew_point_graph_24h
@@ -1299,7 +1381,7 @@ graph:
     height: 51
     color: cyan
     min_value: -10
-    max_value: 15
+    max_value: 25
     min_range: 5
     line_type: SOLID
 
@@ -1310,9 +1392,8 @@ graph:
     width: 146
     height: 51
     color: yellow
-    min_value: 0
-    max_value: 2000
-    min_range: 500
+    min_range: 100
+    max_range: 20000
     line_type: SOLID
 
 # Display
@@ -1334,6 +1415,9 @@ display:
       swap_xy: false
     color_order: bgr
     invert_colors: false
+    # Keep the full-frame buffer (153600 B, PSRAM). A sliced buffer (buffer_size) does fit internal RAM and
+    # makes the single transfer faster, but the page lambda then runs once per slice: measured 8 x ~21 ms
+    # drawing instead of 48 ms once, and the panel builds up visibly from top to bottom.
     update_interval: 4s
     lambda: |-
       // The page is drawn by draw_screen, which the lambda calls once for the display and, after a print
@@ -1350,6 +1434,12 @@ display:
       auto co2 = id(co2_scd40).state;
       auto ch2o = id(ch2o_ze08).state;
       auto e_voc = id(tvoc_ens160).state;
+      auto eco2_ens = id(eco2_ens160).state;
+      auto eco2_sgp = id(eco2_sgp30).state;
+      auto sgp30 = id(tvoc_sgp30).state;
+      // The SGP30 answers 400 ppm / 0 ppb until it has applied its stored baseline a few seconds after a
+      // reboot; hide its columns for the first two minutes so a restart does not show those placeholders.
+      bool sgp30_usable = id(sgp30_baseline_saved) && id(uptime_sensor).state > 120;
       auto pm1 = id(pm1_pms).state;
       auto pm25 = id(pm25_pms).state;
       auto pm10 = id(pm10_pms).state;
@@ -1359,14 +1449,20 @@ display:
       float pressure = id(pres_bme680).state;
       float dew_point = id(dew_point_bme680).state;
       float abs_humidity = id(calculated_absolute_humidity).state;
-      float altitude = id(calculated_altitude).state;
       auto light = id(ambient_light_ltr390).state;
-      col = id(white); if (co2 > 800){col = id(yellow);} if (co2 > 1200){col = id(orange);} if (co2 > 1500){col = id(red);} if (co2 > 1800){col = id(purple);} auto co2_c = col;
-      col = id(white); if (ch2o > 60){col = id(yellow);} if (ch2o > 100){col = id(orange);} if (ch2o > 150){col = id(red);} if (ch2o > 200){col = id(purple);} auto ch2o_c = col;
+      // Colour steps are anchored to published guideline values (see docs/sensor-capability-matrix.md):
+      // CO2 1000 ppm = UBA and ASR A3.6 "ventilate", 2000 ppm = ASR "not acceptable", 3000 ppm far above;
+      // PM2.5 / PM10 = WHO 2021 24 h guidelines and their interim targets, PM10 50 = EU daily limit;
+      // CH2O 80 ppb = 0.1 mg/m3 (WHO indoor air guidelines / UBA indoor value), 120 / 200 / 400 = 1.5x / 2.5x / 5x.
+      col = id(white); if (co2 > 1000){col = id(yellow);} if (co2 > 1500){col = id(orange);} if (co2 > 2000){col = id(red);} if (co2 > 3000){col = id(purple);} auto co2_c = col;
+      col = id(white); if (ch2o > 80){col = id(yellow);} if (ch2o > 120){col = id(orange);} if (ch2o > 200){col = id(red);} if (ch2o > 400){col = id(purple);} auto ch2o_c = col;
+      // TVOC is a sum parameter without a health-based limit; these are the room's own trend bands.
       col = id(white); if (e_voc > 400){col = id(yellow);} if (e_voc > 800){col = id(orange);} if (e_voc > 1400){col = id(red);} if (e_voc > 2000){col = id(purple);} auto e_voc_c = col;
-      col = id(white); if (pm1 > 5){col = id(yellow);} if (pm1 > 10){col = id(orange);} if (pm1 > 15){col = id(red);} if (pm1 > 25){col = id(purple);} auto pm1_c = col;
-      col = id(white); if (pm25 > 5){col = id(yellow);} if (pm25 > 10){col = id(orange);} if (pm25 > 15){col = id(red);} if (pm25 > 25){col = id(purple);} auto pm25_c = col;
-      col = id(white); if (pm10 > 15){col = id(yellow);} if (pm10 > 45){col = id(orange);} if (pm10 > 60){col = id(red);} if (pm10 > 80){col = id(purple);} auto pm10_c = col;
+      col = id(white); if (sgp30 > 400){col = id(yellow);} if (sgp30 > 800){col = id(orange);} if (sgp30 > 1400){col = id(red);} if (sgp30 > 2000){col = id(purple);} auto sgp30_c = col;
+      // No guideline exists for PM1, so it stays neutral instead of colouring at 5 µg/m³.
+      auto pm1_c = id(white);
+      col = id(white); if (pm25 > 15){col = id(yellow);} if (pm25 > 25){col = id(orange);} if (pm25 > 50){col = id(red);} if (pm25 > 75){col = id(purple);} auto pm25_c = col;
+      col = id(white); if (pm10 > 45){col = id(yellow);} if (pm10 > 50){col = id(orange);} if (pm10 > 75){col = id(red);} if (pm10 > 100){col = id(purple);} auto pm10_c = col;
       col = id(white);
       if (!isnan(light)) {
         if (light < 50){col = id(grey);}
@@ -1375,8 +1471,8 @@ display:
         if (light > 2000){col = id(red);}
       }
       auto light_c = col;
-      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
-      float hums[4] = {id(hum_bme680).state, id(hum_sht40).state, id(hum_scd40).state, id(hum_aht20_ens).state};
+      float temps[4] = {id(temp_bme680).state, id(temp_sht41).state, id(temp_scd40).state, id(temp_aht21_ens).state};
+      float hums[4] = {id(hum_bme680).state, id(hum_sht41).state, id(hum_scd40).state, id(hum_aht21_ens).state};
       float temp = NAN;
       float hum = NAN;
       for (float t : temps) { if (!isnan(t)) { temp = t; break; } }
@@ -1389,10 +1485,17 @@ display:
       int bottom_margin_val = 1;
       int bottom_bar_height = font_height_bottom + bottom_margin_val;
       int footer_start_y = h - bottom_bar_height;
-      it.filled_rectangle(0, 0, w, footer_start_y, Color::BLACK);
+      // No page clear here: the display's auto_clear blackens the buffer before the writer runs, and the
+      // printer canvas is cleared by canvas.clear_bits(). A filled_rectangle over the page cost 58 ms.
+      // The top row only exists on the values page: keep the rotation paused while another page shows, so
+      // returning always starts with a full 10 s instead of a random sub-view.
       uint32_t global_current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
-      if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
-        id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+      if (current_main_display_mode == 0) {
+        if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
+          id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+          id(last_top_toggle_time) = global_current_time_ms;
+        }
+      } else {
         id(last_top_toggle_time) = global_current_time_ms;
       }
       int current_top_display_mode = id(top_display_mode_toggle);
@@ -1403,14 +1506,14 @@ display:
       int num_graphs_on_most_pages = 5;
       int graph_height = (footer_start_y - graph_y_start - (num_graphs_on_most_pages-1) * graph_padding) / num_graphs_on_most_pages;
       if (current_main_display_mode == 0) {
-        it.filled_rectangle(0, 0, w, top_section_height + padding_after_top, Color::BLACK);
         if (current_top_display_mode == 0) {
-          int temp_left_x = 100;
-          it.printf(temp_left_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
+          // Same geometry as every other view: the left value ends at left_col_x, the right one at
+          // right_col_x. A separate 100 px offset here put temperature and humidity too close together.
+          it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
           if (!isnan(temp)) {
-              it.printf(temp_left_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", temp);
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", temp);
           } else {
-              it.print(temp_left_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+              it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
           it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "RH");
           it.print(right_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "\%");
@@ -1420,29 +1523,57 @@ display:
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
         } else if (current_top_display_mode == 1) {
+          // Dew point and absolute humidity describe the same water content, so both use one scale. The steps
+          // are the surface temperatures a heated room normally has: coldest inner surfaces (wall corners, the
+          // area behind furniture) sit at 10-12 °C, and above a dew point of 16 °C the air is sultry and
+          // condenses on almost anything. The g/m3 limits are the saturation densities at those dew points
+          // (9.4 / 10.7 / 13.6 g/m3), see docs/thresholds.md.
+          esphome::Color td_c = id(white);
+          if (dew_point > 10) { td_c = id(yellow); }
+          if (dew_point > 12) { td_c = id(orange); }
+          if (dew_point > 16) { td_c = id(red); }
+          esphome::Color ah_c = id(white);
+          if (abs_humidity < 5) { ah_c = id(grey); }
+          if (abs_humidity > 9.4) { ah_c = id(yellow); }
+          if (abs_humidity > 10.7) { ah_c = id(orange); }
+          if (abs_humidity > 13.6) { ah_c = id(red); }
           it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Td °C");
           if (!isnan(dew_point)) {
-              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", dew_point);
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, td_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", dew_point);
           } else {
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
 
           it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "g/m³");
           if (!isnan(abs_humidity)) {
-              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.1f", abs_humidity);
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, ah_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", abs_humidity);
           } else {
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
         } else if (current_top_display_mode == 2) {
+          // QNH on the left once a height is configured, the plain local reading until then (a height of 0
+          // means "not set"). On the right the 3 h tendency, coloured by magnitude: the sign carries the
+          // direction, the colour says how fast — the steps are the WMO tendency classes.
+          float qnh_value = id(qnh).state;
+          bool has_qnh = !isnan(qnh_value);
+          it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, has_qnh ? "QNH" : "local");
           it.printf(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "hPa");
-          if (!isnan(pressure)) {
-              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", pressure);
+          float shown_pressure = has_qnh ? qnh_value : pressure;
+          if (!isnan(shown_pressure)) {
+              it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", shown_pressure);
           } else {
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
-          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "m");
-          if (!isnan(altitude)) {
-              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, white, display::TextAlign::BOTTOM_RIGHT, "%.0f", altitude);
+          float tendency = id(pressure_tendency).state;
+          float tendency_abs = fabsf(tendency);
+          esphome::Color tend_c = id(white);
+          if (tendency_abs > 0.1) { tend_c = id(yellow); }
+          if (tendency_abs > 1.5) { tend_c = id(orange); }
+          if (tendency_abs > 3.5) { tend_c = id(red); }
+          if (tendency_abs > 6.0) { tend_c = id(purple); }
+          it.printf(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "hPa/3h");
+          if (!isnan(tendency)) {
+              it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, tend_c, display::TextAlign::BOTTOM_RIGHT, "%+.1f", tendency);
           } else {
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
@@ -1480,17 +1611,20 @@ display:
               it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "AQI");
               it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
-          // BME680 BSEC2 IAQ (0-500); grey until BSEC2 reports "Calibrating" or "Calibrated".
+          // BME680 BSEC2 IAQ (0-500). The accuracy levels are Stabilizing, Uncertain, Calibrating and
+          // Calibrated; only the last one is a finished calibration, so the value stays grey before that.
+          // Bands from the Bosch scale: 0-50 excellent, 51-100 good, 101-150 moderate, 151-200 unhealthy,
+          // 201-250 very unhealthy, 251-350 severe, 351-500 extreme.
           float iaq = id(iaq_bme680).state;
           const std::string &iaq_acc = id(iaq_accuracy_bme680).state;
-          bool iaq_calibrated = (iaq_acc == "Calibrating" || iaq_acc == "Calibrated");
+          bool iaq_calibrated = (iaq_acc == "Calibrated");
           it.print(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "IAQ");
           if (!isnan(iaq)) {
               esphome::Color iaq_c = id(grey);
               if (iaq_calibrated) {
                 iaq_c = id(white);
-                if (iaq > 300) { iaq_c = id(purple); }
-                else if (iaq > 200) { iaq_c = id(red); }
+                if (iaq > 250) { iaq_c = id(purple); }
+                else if (iaq > 150) { iaq_c = id(red); }
                 else if (iaq > 100) { iaq_c = id(orange); }
                 else if (iaq > 50) { iaq_c = id(yellow); }
               }
@@ -1500,51 +1634,78 @@ display:
           }
         }
         auto cy_main = top_section_height + padding_after_top;
-        auto ix = 0;
         auto title = "";
         auto unit = "";
-        const char *names[3];
-        float values[3];
-        esphome::Color colors[3];
-        int count = 0;
-        if (!isnan(pm1)){
-          count = 0;
-          if(!isnan(pm1)) {names[count] = "PM1"; values[count] = pm1; colors[count] = pm1_c; count++;}
-          if(!isnan(pm25)) {names[count] = "PM2.5"; values[count] = pm25; colors[count] = pm25_c; count++;}
-          if(!isnan(pm10)) {names[count] = "PM10"; values[count] = pm10; colors[count] = pm10_c; count++;}
-          if (count > 0) {
-            title = "Particles"; unit = "µg/m³";
+        // Particles: always drawn, so a missing PMS reading shows as "--" instead of the block silently
+        // disappearing. The PMS keeps its own state across an ESP reboot and can stay asleep, which left
+        // all three values NA and the page without a particles block.
+        {
+          title = "Particles"; unit = "µg/m³";
+          it.line(0,cy_main,w,cy_main,id(white));
+          it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+          it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
+          const char *pm_names[3] = {"PM1", "PM2.5", "PM10"};
+          float pm_values[3] = {pm1, pm25, pm10};
+          esphome::Color pm_colors[3] = {pm1_c, pm25_c, pm10_c};
+          for (int i = 0; i < 3; i++) {
+            // One third per column, left aligned so every row starts at the same edge.
+            int x = 2 + i * w / 3;
+            it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", pm_names[i]);
+            if (!isnan(pm_values[i])) {
+              it.printf(x, cy_main + 50, fv30, pm_colors[i], display::TextAlign::TOP_LEFT, "%.0f", pm_values[i]);
+            } else {
+              it.print(x, cy_main + 50, fv30, id(grey), display::TextAlign::TOP_LEFT, "--");
+            }
+          }
+          cy_main += 88;
+        }
+        // CO2: the SCD40 measures it directly, the ENS160 and SGP30 estimate it from VOCs and sit to the right
+        // under their own "(E)CO2" heading. A column only appears once its sensor has a value; the SGP30 waits
+        // for its learned baseline (sgp30_baseline_saved).
+        {
+          const char *co2_names[3];
+          float co2_values[3];
+          esphome::Color co2_colors[3];
+          int co2_count = 0;
+          bool has_sgp30_eco2 = sgp30_usable && !isnan(eco2_sgp);
+          if (!isnan(co2)) { co2_names[co2_count] = "SCD40"; co2_values[co2_count] = co2; co2_colors[co2_count] = co2_c; co2_count++; }
+          if (!isnan(eco2_ens)) { co2_names[co2_count] = "ENS160"; co2_values[co2_count] = eco2_ens; co2_colors[co2_count] = id(white); co2_count++; }
+          if (has_sgp30_eco2) { co2_names[co2_count] = "SGP30"; co2_values[co2_count] = eco2_sgp; co2_colors[co2_count] = id(white); co2_count++; }
+          if (co2_count > 0) {
+            title = "CO2"; unit = "ppm";
             it.line(0,cy_main,w,cy_main,id(white));
             it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
+            // 14 px on purpose: the 36 px heading font has no parentheses. The label belongs over the first
+            // estimate column, but "CO2" in Orbitron 36 is ~89 px wide and starts at x = 2, so with three
+            // columns the column edge (x = 82) sits inside the title. Push the label past the title then;
+            // with two columns (x = 122) it stays aligned with the ENS160 column.
+            if (co2_count > 1) {
+              const int title_right = 2 + 89;
+              int est_x = 2 + w / co2_count;
+              if (est_x < title_right + 4)
+                est_x = title_right + 4;
+              it.print(est_x, cy_main + 26, fl14, id(grey), TextAlign::CENTER_LEFT, "(E)CO2");
+            }
             it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-            ix = 0;
-            for (int i = 0; i < count; i++){
-              it.printf(w/6*(1+ix*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", names[i]);
-              it.printf(w/6*(1+ix*2), cy_main + 50, fv30, colors[i], display::TextAlign::TOP_CENTER, "%.0f", values[i]);
-              ix++;
+            for (int i = 0; i < co2_count; i++) {
+              // Left aligned: sensors start at the left edge and fill to the right as they deliver values.
+              int x = 2 + i * w / co2_count;
+              it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", co2_names[i]);
+              it.printf(x, cy_main + 50, fv30, co2_colors[i], display::TextAlign::TOP_LEFT, "%.0f", co2_values[i]);
             }
             cy_main += 88;
           }
         }
-        // CO2: only the SCD40, the one sensor that measures CO2 (the eCO2 values are estimates from VOCs); in the
-        // left column like the first value of the other blocks.
-        if (!isnan(co2)) {
-          title = "CO2"; unit = "ppm";
-          it.line(0,cy_main,w,cy_main,id(white));
-          it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
-          it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
-          it.print(w/6, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "SCD40");
-          it.printf(w/6, cy_main + 50, fv30, co2_c, display::TextAlign::TOP_CENTER, "%.0f", co2);
-          cy_main += 88;
-        }
-        // VOC: ZE08 CH2O, ENS160 TVOC and SGP41 VOC index, left to right in the order they first delivered a
-        // value since boot (the ZE08 is usually first, the ENS160 follows after its warm-up). A column keeps its
-        // place and stays empty if its sensor loses its value; a sensor that never delivers (the SGP41 while it
-        // isn't fitted) gets no column. The SGP41 NOx index sits small above "ppb" and only appears with a value
-        // (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
-        if (!isnan(e_voc) || !isnan(ch2o) || !isnan(aqi_voc) || !isnan(aqi_nox)) {
-          title = "VOC";
-          unit = "ppb";
+        // Gas: ZE08 CH2O (formaldehyde) and ENS160 TVOC in ppb, plus ONE of SGP30 (TVOC, ppb) or SGP41 (VOC
+        // index) — the board has room for only one of the two, so both are configured and the fitted one wins.
+        // Fixed order as listed; a column appears only once its sensor is usable (the SGP30 waits for its
+        // learned baseline, see sgp30_baseline_saved). The SGP41 NOx index sits small above the unit and only
+        // appears with a value (no room for a line below: header + 3 blocks use 301 of the 305 px above the footer).
+        bool has_sgp41 = !isnan(aqi_voc);
+        bool has_sgp30 = !has_sgp41 && sgp30_usable && !isnan(sgp30);
+        if (!isnan(ch2o) || !isnan(e_voc) || has_sgp30 || has_sgp41 || !isnan(aqi_nox)) {
+          title = "Gas";
+          unit = has_sgp41 ? "ppb/idx" : "ppb";
           it.line(0,cy_main,w,cy_main,id(white));
           it.print(2, cy_main + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, title);
           it.print(w-2, cy_main + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, unit);
@@ -1553,22 +1714,19 @@ display:
           if (aqi_voc > 150) { aqi_voc_c = id(orange); }
           if (aqi_voc > 250) { aqi_voc_c = id(red); }
           if (aqi_voc > 350) { aqi_voc_c = id(purple); }
-          const char *voc_names[3] = {"ZE08-CH2O", "ENS160", "SGP41 idx"};
-          float voc_values[3] = {ch2o, e_voc, aqi_voc};
-          esphome::Color voc_colors[3] = {ch2o_c, e_voc_c, aqi_voc_c};
-          static int voc_order[3];  // sensor index per column, filled as sensors deliver their first value
-          static int voc_columns = 0;
-          for (int s = 0; s < 3; s++) {
-            if (isnan(voc_values[s])) continue;
-            bool placed = false;
-            for (int col = 0; col < voc_columns; col++) placed |= voc_order[col] == s;
-            if (!placed) voc_order[voc_columns++] = s;
-          }
-          for (int col = 0; col < voc_columns; col++) {
-            int s = voc_order[col];
-            if (isnan(voc_values[s])) continue;
-            it.printf(w/6*(1+col*2), cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "%s", voc_names[s]);
-            it.printf(w/6*(1+col*2), cy_main + 50, fv30, voc_colors[s], display::TextAlign::TOP_CENTER, "%.0f", voc_values[s]);
+          const char *gas_names[3];
+          float gas_values[3];
+          esphome::Color gas_colors[3];
+          int gas_count = 0;
+          if (!isnan(ch2o)) { gas_names[gas_count] = "ZE08-CH2O"; gas_values[gas_count] = ch2o; gas_colors[gas_count] = ch2o_c; gas_count++; }
+          if (!isnan(e_voc)) { gas_names[gas_count] = "ENS160"; gas_values[gas_count] = e_voc; gas_colors[gas_count] = e_voc_c; gas_count++; }
+          if (has_sgp41) { gas_names[gas_count] = "SGP41 idx"; gas_values[gas_count] = aqi_voc; gas_colors[gas_count] = aqi_voc_c; gas_count++; }
+          else if (has_sgp30) { gas_names[gas_count] = "SGP30"; gas_values[gas_count] = sgp30; gas_colors[gas_count] = sgp30_c; gas_count++; }
+          for (int i = 0; i < gas_count; i++) {
+            // Left aligned like the other blocks: values appear from the left as sensors come online.
+            int x = 2 + i * w / gas_count;
+            it.printf(x, cy_main + 58, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%s", gas_names[i]);
+            it.printf(x, cy_main + 50, fv30, gas_colors[i], display::TextAlign::TOP_LEFT, "%.0f", gas_values[i]);
           }
           if(!isnan(aqi_nox)){
             esphome::Color aqi_nox_c = id(white);
@@ -1585,29 +1743,25 @@ display:
          int graph_y_current = graph_y_start;
          int label_col_x = 80;
          int graph_col_x = 85;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb  %d", 600);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(voc_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2000);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 3400);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
          it.graph(graph_col_x, graph_y_current, id(co2_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 15);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM1");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm1_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 30);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM2.5");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm25_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 55);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM10");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm10_graph));
          graph_y_current += graph_height + graph_padding;
       } else if (current_main_display_mode == 2) {
@@ -1629,47 +1783,43 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
          it.graph(graph_col_x, graph_y_current, id(pressure_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 25.0);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", 0.0);
+         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", -10.0);
          it.graph(graph_col_x, graph_y_current, id(dew_point_graph));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx  %.0f", 2000.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Light");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
          it.graph(graph_col_x, graph_y_current, id(light_graph));
          graph_y_current += graph_height + graph_padding;
       } else if (current_main_display_mode == 3) {
          auto cy_info = 10;
          it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Alarm Conditions");
          cy_info += fl18->get_height() + 3;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CO2 (SCD40) > %.0f ppm", id(co2_alarm_threshold).state);
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CO2 > %.0f ppm", id(co2_alarm_threshold).state);
          cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CH2O > %.0f ppb", id(ch2o_alarm_threshold).state);
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- PM2.5 / PM10 > %.0f / %.0f µg/m³", id(pm25_alarm_threshold).state,
+                   id(pm10_alarm_threshold).state);
          cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC (ENS160) > %.0f ppb", id(tvoc_alarm_threshold_ens).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC (SGP30) > %.0f ppb", id(tvoc_alarm_threshold_sgp30).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM1) > %.0f µg/m³", id(pm1_alarm_threshold).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM2.5) > %.0f µg/m³", id(pm25_alarm_threshold).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Particles (PM10) > %.0f µg/m³", id(pm10_alarm_threshold).state);
+         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "after 5 min, only with Buzzer Alarm on");
          cy_info += fl14->get_height() + 5;
-         it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Graph Timeframes");
+         it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Pages and Controls");
          cy_info += fl18->get_height() + 3;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 3: 1h Heap PSRAM Loop");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 1 values / 2 help");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 4: 1h TVOC CO2 Particles");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 3 1h RAM / 4 air / 5 climate");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 5: 1h Temp RH hPa Td Lux");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- 6 air / 7 climate 24h / 8 QR");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 6: 24h TVOC CO2 Particles");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- top row: 5 views, 10 s each");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 7: 24h Temp RH hPa Td Lux");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- footer: date/IP, 10 s each");
          cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- Page 8: QR Code Web UI");
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- press: next page");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- hold 5 s: print page");
+         cy_info += fl14->get_height() + 1;
+         it.print(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- idle 30 s: back to page 1");
       } else if (current_main_display_mode == 6) {
          int graph_y_current = graph_y_start;
          int label_col_x = 80;
@@ -1677,52 +1827,48 @@ display:
          int storage_graph_spacing = 2;
          int num_graphs_on_this_page = 5;
          int graph_height_storage = (footer_start_y - graph_y_start - (num_graphs_on_this_page-1) * storage_graph_spacing) / num_graphs_on_this_page;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 350.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 100.0);
          it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Heap Free");
          it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
          it.graph (graph_col_x, graph_y_current, id(heap_free_graph_1h));
          graph_y_current += graph_height_storage + storage_graph_spacing;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 100.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 64.0);
          it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Heap Block");
          it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
          it.graph (graph_col_x, graph_y_current, id(heap_max_block_graph_1h));
          graph_y_current += graph_height_storage + storage_graph_spacing;
          it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "KB  %.0f", 2000.0);
          it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PSRAM");
-         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 1700.0);
          it.graph (graph_col_x, graph_y_current, id(free_psram_graph_1h));
          graph_y_current += graph_height_storage + storage_graph_spacing;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "ms  %.0f", 350.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey),  TextAlign::TOP_RIGHT, "ms  %.0f", 250.0);
          it.printf(label_col_x, graph_y_current + graph_height_storage / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Loop Time");
-         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
+         it.printf(label_col_x, graph_y_current + graph_height_storage - 1, fl14, id(grey),  TextAlign::BOTTOM_RIGHT, "%.0f", 100.0);
          it.graph (graph_col_x, graph_y_current, id(loop_time_graph_1h));
       } else if (current_main_display_mode == 4) {
          int graph_y_current = graph_y_start;
          int label_col_x = 80;
          int graph_col_x = 85;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb  %d", 600);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppb");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "TVOC");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(voc_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 2000);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "ppm  %d", 3400);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "CO2");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 400);
          it.graph(graph_col_x, graph_y_current, id(co2_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 15);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM1");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm1_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 30);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM2.5");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm25_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³  %d", 55);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "µg/m³");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "PM10");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%d", 0);
          it.graph(graph_col_x, graph_y_current, id(pm10_graph_24h));
          graph_y_current += graph_height + graph_padding;
       } else if (current_main_display_mode == 5) {
@@ -1744,14 +1890,13 @@ display:
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 930.0);
          it.graph(graph_col_x, graph_y_current, id(pressure_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 15.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "°C  %.1f", 25.0);
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Dewpoint");
          it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.1f", -10.0);
          it.graph(graph_col_x, graph_y_current, id(dew_point_graph_24h));
          graph_y_current += graph_height + graph_padding;
-         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx  %.0f", 2000.0);
+         it.printf(label_col_x, graph_y_current, fl14, id(grey), TextAlign::TOP_RIGHT, "lx");
          it.printf(label_col_x, graph_y_current + graph_height / 2, fl14, id(white), TextAlign::CENTER_RIGHT, "Light");
-         it.printf(label_col_x, graph_y_current + graph_height - 1, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "%.0f", 0.0);
          it.graph(graph_col_x, graph_y_current, id(light_graph_24h));
          graph_y_current += graph_height + graph_padding;
       } else if (current_main_display_mode == 7) {
@@ -1764,7 +1909,7 @@ display:
          auto qr_matrix_size = id(webserver_qr).get_size();
          int max_scale_w = w / qr_matrix_size;
          int max_scale_h = (footer_start_y - (fl14->get_height() + 10)) / qr_matrix_size;
-         int scale = std::min(max_scale_w, max_scale_h);
+         int scale = max_scale_w < max_scale_h ? max_scale_w : max_scale_h;
          if (scale <= 0) scale = 1;
          auto drawn_qr_size = qr_matrix_size * scale;
          int qr_x = (w - drawn_qr_size) / 2;
@@ -1773,7 +1918,6 @@ display:
          it.print(w/2, footer_start_y - 10, fl14, id(grey), TextAlign::BOTTOM_CENTER, "Scan for Webserver");
       }
       int text_baseline_y = h - bottom_margin_val - 4;
-      it.filled_rectangle(0, footer_start_y, w, bottom_bar_height, Color::BLACK);
       int displayed_page_number;
       if (current_main_display_mode == 0) displayed_page_number = 1;
       else if (current_main_display_mode == 3) displayed_page_number = 2;
@@ -1807,27 +1951,27 @@ display:
         }
       } else if (current_main_display_mode == 1) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 2) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 3) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Info Page");
-          float altitude = id(calculated_altitude).state;
-          if (isnan(altitude)) {
-              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- m");
+          float qnh_value = id(qnh).state;
+          if (isnan(qnh_value)) {
+              it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "-- hPa");
           } else {
-              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f m", altitude);
+              it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%.0f hPa", qnh_value);
           }
       } else if (current_main_display_mode == 6) {
-          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "Ram CPU");
-          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 1h");
+          it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "RAM CPU");
+          it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 1h");
       } else if (current_main_display_mode == 4) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 24h");
       } else if (current_main_display_mode == 5) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "THPDL");
-          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphen 24h");
+          it.printf(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "Graphs 24h");
       } else if (current_main_display_mode == 7) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "QR Code");
       }
@@ -1964,20 +2108,25 @@ sensor:
     icon: "mdi:gas-cylinder"
     filters: 
       - filter_out: 2000.0
+      # The ZE08 datasheet specifies no accuracy at all (only a resolution of ≤0.01 ppm), its protocol has no
+      # zero-point command, and the manufacturer warns that the zero drifts after long exposure to organic
+      # gases. The reading is therefore only a relative value: "CH2O Offset" is subtracted here (like the
+      # temperature offsets) and is set in fresh air with the "Zero CH2O (fresh air)" button.
+      - offset: !lambda return -id(ch2o_offset).state;
       - exponential_moving_average:
           send_every: 30
           alpha: 0.5
 
   - platform: template
-    name: "SHT40 Dewpoint"
+    name: "SHT41 Dewpoint"
     unit_of_measurement: "°C"
     state_class: measurement
     device_class: temperature
     id: dew_point_sensor
     icon: "mdi:water-thermometer"
     lambda: |-
-      float temperature = id(temp_sht40).state;
-      float humidity = id(hum_sht40).state;
+      float temperature = id(temp_sht41).state;
+      float humidity = id(hum_sht41).state;
       if (isnan(temperature) || isnan(humidity)) {
         return NAN;
       }
@@ -2020,13 +2169,13 @@ sensor:
         t = id(temp_bme680).state;
         rh = id(hum_bme680).state;
       }
-      else if (!isnan(id(temp_sht40).state) && !isnan(id(hum_sht40).state)) {
-        t = id(temp_sht40).state;
-        rh = id(hum_sht40).state;
+      else if (!isnan(id(temp_sht41).state) && !isnan(id(hum_sht41).state)) {
+        t = id(temp_sht41).state;
+        rh = id(hum_sht41).state;
       }
       else {
-        float temps[2] = {id(temp_scd40).state, id(temp_aht20_ens).state};
-        float hums[2] = {id(hum_scd40).state, id(hum_aht20_ens).state};
+        float temps[2] = {id(temp_scd40).state, id(temp_aht21_ens).state};
+        float hums[2] = {id(hum_scd40).state, id(hum_aht21_ens).state};
         for(int i = 0; i < 2; i++) {
           if(!isnan(temps[i]) && !isnan(hums[i])) {
             t = temps[i];
@@ -2049,7 +2198,7 @@ sensor:
     unit_of_measurement: "°C"
     accuracy_decimals: 1
     lambda: |-
-      float temps[4] = {id(temp_bme680).state, id(temp_sht40).state, id(temp_scd40).state, id(temp_aht20_ens).state};
+      float temps[4] = {id(temp_bme680).state, id(temp_sht41).state, id(temp_scd40).state, id(temp_aht21_ens).state};
       float selected_temp = NAN;
       for(int i = 0; i < 4; i++){
         if(!isnan(temps[i])){
@@ -2059,30 +2208,52 @@ sensor:
       }
       return selected_temp;
 
+  # QNH — the pressure reduced to sea level, i.e. the value weather reports quote. The local reading alone
+  # says nothing about the weather (the box sits at around 400 m), so this needs the height once. Nothing
+  # depends on it: the SCD40 takes its pressure compensation straight from pres_bme680
+  # (ambient_pressure_compensation_source), because that is the actual ambient pressure.
   - platform: template
-    name: "Calculated Altitude"
-    id: calculated_altitude
-    unit_of_measurement: "m"
+    name: "Sea Level Pressure (QNH)"
+    id: qnh
+    unit_of_measurement: "hPa"
     state_class: "measurement"
-    icon: "mdi:mountain"
-    update_interval: 15min
+    icon: "mdi:gauge"
+    update_interval: 60s
     lambda: |-
-      float local_pressure = NAN;
-      if (id(pres_bme680).has_state()) {
-          local_pressure = id(pres_bme680).state;
+      float local_pressure = id(pres_bme680).state;
+      float local_temperature = id(temp_bme680).state;
+      float height = id(station_height).state;
+      if (!isnan(local_pressure) && !isnan(local_temperature) && !isnan(height) && local_pressure > 0 && height > 0) {
+        // ICAO barometric formula, inverted: the height is known and the height sensor is not needed.
+        id(last_valid_qnh) = local_pressure * pow(1.0 - (0.0065 * height) / (local_temperature + 0.0065 * height + 273.15), -5.257);
       }
-      float local_temperature = NAN;
-      if (id(temp_bme680).has_state()) {
-          local_temperature = id(temp_bme680).state;
+      return id(last_valid_qnh);
+
+  # 3 h pressure tendency, the classic barometer reading: falling means a low is approaching, rising means it
+  # is clearing up. 37 samples at the BSEC rate (5 min) span exactly three hours.
+  - platform: template
+    name: "Pressure Tendency 3h"
+    id: pressure_tendency
+    unit_of_measurement: "hPa/3h"
+    accuracy_decimals: 1
+    state_class: "measurement"
+    icon: "mdi:trending-up"
+    update_interval: 5min
+    lambda: |-
+      static float samples[37];
+      static int count = 0;
+      float local_pressure = id(pres_bme680).state;
+      if (isnan(local_pressure) || local_pressure <= 0) {
+        return id(last_tendency);  // BSEC has no reading yet: keep the last known tendency
       }
-      float sea_level_pressure_ref = id(manual_sea_level_pressure).state;  // Deklaration und Initialisierung
-      if (!isnan(local_pressure) && !isnan(local_temperature) && !isnan(sea_level_pressure_ref)) {
-          if (local_pressure > 0 && sea_level_pressure_ref > 0) {
-              float altitude = (pow(sea_level_pressure_ref / local_pressure, 1.0/5.257) - 1.0) * (local_temperature + 273.15) / 0.0065;
-              return altitude;
-          }
+      int write_index = count % 37;
+      samples[write_index] = local_pressure;
+      count++;
+      if (count > 36) {
+        // The slot after the one just written holds the sample from 36 intervals (= 3 h) ago.
+        id(last_tendency) = local_pressure - samples[(write_index + 1) % 37];
       }
-      return NAN;
+      return id(last_tendency);
 
   - platform: template
     name: "ENS160 Warmup Max Remaining"
@@ -2093,11 +2264,36 @@ sensor:
     accuracy_decimals: 0
     update_interval: 10s
     lambda: |-
-      // Upper bound only: the ENS160 publishes as soon as its data is valid.
-      if (id(eco2_ens160).has_state()) return 0;
+      // ESPHome docs: 1 h after the very first power-up, about 3 min after a reboot. The flag is cleared
+      // by the first valid reading, so the upper bound matches whichever case applies.
+      if (id(eco2_ens160).has_state()) {
+        id(ens160_cold_start) = false;
+        return 0;
+      }
+      int limit = id(ens160_cold_start) ? 60 : 3;
       int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
-      if (elapsed_min >= 60) return 0;
-      return 60 - (int) elapsed_min;
+      if (elapsed_min >= limit) return 0;
+      return limit - (int) elapsed_min;
+
+  # 12 h learning time of the SGP30; 0 from the moment the baseline counts as stored.
+  - platform: template
+    name: "SGP30 Warmup Max Remaining"
+    id: sgp30_warmup_remaining
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "min"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      // Counts the current uptime window, not a stored flag: ESPHome restarts the 12 h on every boot and
+      // only writes the baseline to flash after a full window. 0 = window complete.
+      if (!id(sgp30_baseline_saved) && id(tvoc_sgp30).has_state() &&
+          esp_timer_get_time() >= 12LL * 3600LL * 1000000LL) {
+        id(sgp30_baseline_saved) = true;
+      }
+      int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
+      if (elapsed_min >= 720) return 0;
+      return 720 - (int) elapsed_min;
       
   # Debug Sensors
   - platform: debug
@@ -2203,21 +2399,22 @@ sensor:
     address: 0x44
     i2c_id: i2c_1
     temperature:
-      name: "SHT40 Temperature"
-      id: temp_sht40
+      name: "SHT41 Temperature"
+      id: temp_sht41
       icon: "mdi:thermometer"
       filters:
-        - offset: !lambda return id(temp_sht40_offset).state;
+        - offset: !lambda return id(temp_sht41_offset).state;
     humidity:
-      name: "SHT40 Relative Humidity"
-      id: hum_sht40
+      name: "SHT41 Relative Humidity"
+      id: hum_sht41
       icon: "mdi:water-percent"
       filters:
-        - offset: !lambda return id(hum_sht40_offset).state;
+        - offset: !lambda return id(hum_sht41_offset).state;
     precision: High
     update_interval: 79s
 
   - platform: scd4x
+    id: scd4x_chip
     address: 0x62
     i2c_id: i2c_1
     co2:
@@ -2236,11 +2433,15 @@ sensor:
       icon: "mdi:water-percent"
       filters:
         - offset: !lambda return id(hum_scd40_offset).state;
+    # ESPHome's default is 4 °C; the chip applies it before this config's own "SCD40 Temperature Offset"
+    # filter, so the two never stack. Explicit so a default change upstream can't silently shift readings.
+    temperature_offset: 4
     automatic_self_calibration: true
     ambient_pressure_compensation_source: pres_bme680
     update_interval: 33s
 
   - platform: sgp30
+    id: sgp30_chip
     i2c_id: i2c_1
     address: 0x58
     eco2:
@@ -2264,9 +2465,12 @@ sensor:
     update_interval: 36s
     # SHT41: the most accurate temperature/humidity sensor in the box.
     compensation:
-      humidity_source: hum_sht40
-      temperature_source: temp_sht40
+      humidity_source: hum_sht41
+      temperature_source: temp_sht41
 
+  # Not populated in this box: there is no SGP41 at 0x59, so setup logs "Get serial number failed" and the
+  # component is marked FAILED on every boot; both entities stay unavailable. The block is kept for a later
+  # upgrade — comment it out if the chip won't be fitted.
   - platform: sgp4x
     i2c_id: i2c_1
     #address: 0x59
@@ -2288,8 +2492,8 @@ sensor:
       unit_of_measurement: "index points"
     # SHT41: the most accurate temperature/humidity sensor in the box.
     compensation:
-      humidity_source: hum_sht40
-      temperature_source: temp_sht40
+      humidity_source: hum_sht41
+      temperature_source: temp_sht41
     store_baseline: True
     update_interval: 41s
 
@@ -2301,15 +2505,25 @@ sensor:
       name: "LTR390 UV Index"
       id: uv_index_ltr390
       icon: "mdi:sun-wireless-outline"
+      # The datasheet's 2300 counts/UVI only hold for gain X18 at 20 bit; ESPHome scales other combinations
+      # linearly. Applied here as a multiplier, which is what the datasheet's WFAC does to lux and UVI alike.
+      filters:
+        - multiply: !lambda return id(ltr_wfac).state;
     light:
       name: "LTR390 Ambient Light"
       icon: "mdi:weather-sunny"
       id: ambient_light_ltr390
+      filters:
+        - multiply: !lambda return id(ltr_wfac).state;
       on_value:
         then:
           - script.execute: adjust_backlight_based_on_light
-    gain: X3
-    resolution: 18   
+    gain:
+      ambient_light: X3
+      uv: X18
+    resolution:
+      ambient_light: 18
+      uv: 20
     update_interval: 11s
 
   # All outputs follow the hub's ULP rate (every 5 min). Per-sensor LP with a ULP hub fails at setup:
@@ -2359,19 +2573,19 @@ sensor:
     i2c_id: i2c_2
     variant: AHT20
     temperature:
-      name: "AHT20 ENS160 Temperature"
-      id: temp_aht20_ens
+      name: "AHT21 ENS160 Temperature"
+      id: temp_aht21_ens
       icon: "mdi:thermometer"
       disabled_by_default: false
       filters:
-        - offset: !lambda return id(temp_aht20_ens_offset).state;
+        - offset: !lambda return id(temp_aht21_ens_offset).state;
     humidity:
-      name: "AHT20 ENS160 Humidity"
-      id: hum_aht20_ens
+      name: "AHT21 ENS160 Humidity"
+      id: hum_aht21_ens
       icon: "mdi:water-percent"
       disabled_by_default: false
       filters:
-        - offset: !lambda return id(hum_aht20_ens_offset).state;
+        - offset: !lambda return id(hum_aht21_ens_offset).state;
     update_interval: 73s
 
   - platform: ens160_i2c
@@ -2395,14 +2609,16 @@ sensor:
     update_interval: 17s
     # SHT41: the most accurate temperature/humidity sensor in the box (the AHT21 next to the ENS160 reads its heat).
     compensation:
-      temperature: temp_sht40
-      humidity: hum_sht40
+      temperature: temp_sht41
+      humidity: hum_sht41
 
   # Serial Bus
   - platform: pmsx003
     type: PMSX003
-    # Above 30 s the sensor sleeps between readings and wakes 30 s early: 30 s on, 90 s off.
-    update_interval: 120s
+    # 30 s keeps the fan and laser running continuously. Above 30 s ESPHome sleeps the sensor between
+    # readings and wakes it 30 s early (30 s on, 90 s off at 120 s); the PMS keeps that state across an
+    # ESP reboot and once stayed asleep, with all three values at NA until a mains power cycle.
+    update_interval: 30s
     uart_id: uart_pms
     pm_1_0:
       name: "PMS Particulate Matter <1.0µm Concentration"
@@ -2471,7 +2687,7 @@ switch:
       - output.turn_off: buzzer_output
 
   - platform: template
-    name: "Buzzer Alarm Aktiv"
+    name: "Buzzer Alarm"
     id: buzzer_alarm_enable_switch
     entity_category: config
     icon: "mdi:alarm-light"
@@ -2521,6 +2737,37 @@ button:
       sorting_weight: 4
     on_press:
       - lambda: sdlog::request_unmount();
+  # Air filter: the four speed limits back to their defaults (10 / 50 µg/m³ PM2.5, 800 / 2000 ppb TVOC).
+  # Needed because the numbers are restored from flash: a changed default in this file only reaches a box
+  # that has never stored a value. The speeds are also re-evaluated right away instead of on the next 30 s tick.
+  - platform: template
+    name: "Filter Thresholds Reset"
+    id: filter_thresholds_reset
+    icon: "mdi:backup-restore"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 15
+    on_press:
+      - number.set:
+          id: filter_pm_start
+          value: 10
+      - number.set:
+          id: filter_pm_full
+          value: 50
+      - number.set:
+          id: filter_tvoc_start
+          value: 800
+      - number.set:
+          id: filter_tvoc_full
+          value: 2000
+      - lambda: |-
+          // -1 makes airfilter::speed_for() recompute the level from scratch instead of keeping the
+          // hysteresis state of the old thresholds.
+          id(filter_speed_pm) = -1;
+          id(filter_speed_tvoc) = -1;
+      - script.execute: filter_control
+      - component.update: filter_steps
   # Calibration: set every temperature or humidity offset from the "Reference ..." value (script calibrate_offsets).
   - platform: template
     name: "Calibrate Temperature"
@@ -2544,6 +2791,38 @@ button:
       - script.execute:
           id: calibrate_offsets
           humidity: true
+  # ZE08-CH2O zero point: the sensor has a fixed offset that drifts. Run the box in fresh air for a few
+  # minutes, then press this to subtract the current reading, so display, colour steps and log start at 0.
+  - platform: template
+    name: "Zero CH2O (fresh air)"
+    icon: "mdi:gas-cylinder"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 7
+    on_press:
+      - lambda: |-
+          float corrected = id(ch2o_ze08).state;
+          if (std::isnan(corrected))
+            return;
+          // corrected = raw - offset, so adding the corrected reading to the offset makes the next one 0.
+          id(ch2o_offset).make_call().set_value(id(ch2o_offset).state + corrected).perform();
+  # SCD40 CO2: forced recalibration against fresh air. Sensirion requires running the sensor in the mode used
+  # later for more than 3 minutes in fresh air (~400-450 ppm) before this; 420 ppm is the current global
+  # monthly mean. Automatic self calibration stays enabled.
+  - platform: template
+    name: "Calibrate SCD40 CO2 (420 ppm)"
+    icon: "mdi:molecule-co2"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 6
+    on_press:
+      - scd4x.perform_forced_calibration:
+          id: scd4x_chip
+          value: 420
+      - lambda: |-
+          id(calibration_status).publish_state("CO2: forced calibration to 420 ppm");
   # Same as holding the top button for 5 s.
   - platform: template
     name: "Print Screen"
@@ -2585,6 +2864,21 @@ interval:
           if (state == id(filter_seen_state)) return;
           id(filter_seen_state) = state;
           id(filter_status).publish_state(airfilter::status_text());
+  # PMS watchdog: while the sensor reports nothing (asleep or wedged) resend the wake-up frames every 5 min.
+  # Once frames arrive the state becomes a number and this stops on its own.
+  # startup_delay: without it the interval fires once right at boot, so the WARN and the extra wake frames
+  # duplicate the on_boot wake-up that already ran two seconds earlier.
+  - interval: 300s
+    startup_delay: 300s
+    then:
+      - if:
+          condition:
+            lambda: return isnan(id(pm1_pms).state);
+          then:
+            - logger.log:
+                level: WARN
+                format: "PMS still silent, resending wake-up frames"
+            - script.execute: pms_wake
   # SD card log: one CSV row per minute into /sdcard/YYYYMMDD.CSV.
   - interval: 60s
     then:
@@ -2625,10 +2919,10 @@ interval:
           row.num(id(pm10_pms).state, 0);
           row.num(id(ambient_light_ltr390).state, 1);
           row.num(id(uv_index_ltr390).state, 2);
-          row.num(id(temp_sht40).state, 2);
-          row.num(id(hum_sht40).state, 2);
-          row.num(id(temp_aht20_ens).state, 2);
-          row.num(id(hum_aht20_ens).state, 2);
+          row.num(id(temp_sht41).state, 2);
+          row.num(id(hum_sht41).state, 2);
+          row.num(id(temp_aht21_ens).state, 2);
+          row.num(id(hum_aht21_ens).state, 2);
           row.num(id(dew_point_bme680).state, 2);
           row.num(id(dew_point_sensor).state, 2);
           row.num(id(calculated_absolute_humidity).state, 2);
@@ -2646,16 +2940,25 @@ interval:
       - if:
           condition:
             lambda: |-
-              return (id(buzzer_alarm_enabled) &&
-                      (
-                        (id(co2_scd40).state > id(co2_alarm_threshold).state) ||
-                        (id(ch2o_ze08).state > id(ch2o_alarm_threshold).state) ||
-                        (id(tvoc_ens160).state > id(tvoc_alarm_threshold_ens).state) ||
-                        (id(tvoc_sgp30).state > id(tvoc_alarm_threshold_sgp30).state) ||
-                        (id(pm1_pms).state > id(pm1_alarm_threshold).state) ||
-                        (id(pm25_pms).state > id(pm25_alarm_threshold).state) ||
-                        (id(pm10_pms).state > id(pm10_alarm_threshold).state)
-                      ));
+              static const uint32_t ALARM_DELAY_MS = 5UL * 60UL * 1000UL;
+              if (!id(buzzer_alarm_enabled)) {
+                id(alarm_above_since) = 0;
+                return false;
+              }
+              // Only CO2, PM2.5 and PM10 have a health-based limit; CH2O and TVOC stay on the display only.
+              bool above = (id(co2_scd40).state > id(co2_alarm_threshold).state) ||
+                           (id(pm25_pms).state > id(pm25_alarm_threshold).state) ||
+                           (id(pm10_pms).state > id(pm10_alarm_threshold).state);
+              if (!above) {
+                id(alarm_above_since) = 0;
+                return false;
+              }
+              uint32_t now = millis();
+              if (id(alarm_above_since) == 0) {
+                id(alarm_above_since) = now == 0 ? 1 : now;
+                return false;
+              }
+              return (uint32_t) (now - id(alarm_above_since)) >= ALARM_DELAY_MS;
           then:
             - switch.turn_on: buzzer_switch
             - delay: 1s
@@ -2682,6 +2985,19 @@ time:
 
 # Scripts
 script:
+  # PMS5003 wake-up and active mode (manual v2.3, appendix II): 42 4D | CMD | DATAH | DATAL | LRC, where LRC
+  # is the sum of the first five bytes. E4 00 01 = wake up, E1 00 01 = active mode (continuous frames).
+  # A sensor that is already awake simply stays awake, so sending this is always safe.
+  - id: pms_wake
+    mode: single
+    then:
+      - uart.write:
+          id: uart_pms
+          data: [0x42, 0x4D, 0xE4, 0x00, 0x01, 0x01, 0x74]
+      - delay: 300ms
+      - uart.write:
+          id: uart_pms
+          data: [0x42, 0x4D, 0xE1, 0x00, 0x01, 0x01, 0x71]
   # Screen print (thermal_print.h): the next display update draws the page into the printer canvas too.
   - id: print_screen
     mode: single
@@ -2726,7 +3042,7 @@ script:
   # fan speed 0-6 from PM2.5 (PMS) and TVOC (ENS160), the higher of the two; see the "Filter Speed ..." numbers.
   # Runs every 30 s; while "Filter Auto" is on it sends when the speed changes and every 2 min, so the filter
   # gets its speed back after a restart. Nothing is sent while both values are off or have no reading (the
-  # ENS160 warms up after each boot).
+  # ENS160 warms up after a reboot).
   - id: filter_control
     mode: single
     then:
@@ -2735,7 +3051,7 @@ script:
                                                      id(filter_pm_start).state, id(filter_pm_full).state);
           id(filter_speed_tvoc) = airfilter::speed_for(id(filter_speed_tvoc), id(tvoc_ens160).state,
                                                        id(filter_tvoc_start).state, id(filter_tvoc_full).state);
-          int speed = std::max(id(filter_speed_pm), id(filter_speed_tvoc));
+          int speed = id(filter_speed_pm) > id(filter_speed_tvoc) ? id(filter_speed_pm) : id(filter_speed_tvoc);
           if (speed < 0) return;
           if (id(filter_target_speed).state != speed) id(filter_target_speed).publish_state(speed);
           if (!id(filter_auto).state) return;
@@ -2766,15 +3082,15 @@ script:
             number::Number *offset;
           };
           const Item temperatures[] = {
-              {"SHT40", id(temp_sht40), id(temp_sht40_offset)},
+              {"SHT41", id(temp_sht41), id(temp_sht41_offset)},
               {"SCD40", id(temp_scd40), id(temp_scd40_offset)},
-              {"AHT20", id(temp_aht20_ens), id(temp_aht20_ens_offset)},
+              {"AHT21", id(temp_aht21_ens), id(temp_aht21_ens_offset)},
               {"BME680", id(temp_bme680), id(temp_bme680_offset)},
           };
           const Item humidities[] = {
-              {"SHT40", id(hum_sht40), id(hum_sht40_offset)},
+              {"SHT41", id(hum_sht41), id(hum_sht41_offset)},
               {"SCD40", id(hum_scd40), id(hum_scd40_offset)},
-              {"AHT20", id(hum_aht20_ens), id(hum_aht20_ens_offset)},
+              {"AHT21", id(hum_aht21_ens), id(hum_aht21_ens_offset)},
               {"BME680", id(hum_bme680), id(hum_bme680_offset)},
           };
           const Item *items = humidity ? humidities : temperatures;
@@ -2794,7 +3110,8 @@ script:
             float min_offset = item.offset->traits.get_min_value();
             float max_offset = item.offset->traits.get_max_value();
             bool limited = offset < min_offset || offset > max_offset;
-            offset = std::max(min_offset, std::min(max_offset, offset));
+            if (offset < min_offset) offset = min_offset;
+            if (offset > max_offset) offset = max_offset;
             auto call = item.offset->make_call();
             call.set_value(offset);
             call.perform();
