@@ -4,6 +4,9 @@ Which physical sensor outputs which measurement. Based on `esphome/airquality.ya
 Derived/template values (dewpoint, absolute humidity, "Best Temperature", IAQ classification, system metrics)
 are left out — this only covers the sensor chips themselves.
 
+How the firmware judges these readings — colour steps, alarm limits and the air filter control — is in
+[thresholds.md](thresholds.md).
+
 | Measurement | SHT41 | SCD40 | SGP30 | SGP41 | LTR390 | AHT21 | ENS160 | BME680 | ZE08-CH2O | PMSx003 | SR602 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Bus / interface | I²C1, 0x44 | I²C1, 0x62 | I²C1, 0x58 | I²C1, 0x59 (not populated) | I²C1, 0x53 | I²C2, 0x38 | I²C2, 0x53 | I²C1, 0x77 | UART | UART | GPIO39, digital |

@@ -282,6 +282,37 @@ text_sensor:
       }
       return {"No data"};
 
+  # Countdown for the SGP30 baseline. Sensirion requires 12 h of uninterrupted operation before the baseline
+  # is learned and ESPHome can store it; every reboot, flash and power cut restarts that window, so this
+  # counts the current uptime and shows when it will be done. Nothing to press: it starts at boot by itself.
+  - platform: template
+    name: "SGP30 Baseline Timer"
+    id: sgp30_baseline_timer
+    icon: "mdi:timer-sand-complete"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 20
+    update_interval: 30s
+    lambda: |-
+      const int64_t need_s = 12LL * 3600LL;
+      int64_t up_s = esp_timer_get_time() / 1000000LL;
+      char buf[64];
+      if (up_s >= need_s) {
+        return std::string("complete - baseline stored in flash");
+      }
+      int64_t left_s = need_s - up_s;
+      auto now = id(esptime).now();
+      if (now.is_valid()) {
+        auto ready = esphome::ESPTime::from_epoch_local((time_t) now.timestamp + (time_t) left_s);
+        snprintf(buf, sizeof(buf), "%lld h %02lld min left, ready %02d:%02d", (long long) (left_s / 3600),
+                 (long long) ((left_s % 3600) / 60), ready.hour, ready.minute);
+      } else {
+        snprintf(buf, sizeof(buf), "%lld h %02lld min left", (long long) (left_s / 3600),
+                 (long long) ((left_s % 3600) / 60));
+      }
+      return std::string(buf);
+
 # QR Code generator
 qr_code:
   - id: webserver_qr
@@ -325,6 +356,12 @@ globals:
     type: bool
     restore_value: yes
     initial_value: 'false'
+  # Buzzer alarm: millis() when a limit was first exceeded, 0 = no limit exceeded. The alarm only sounds
+  # after the condition held for 5 min, so a candle, a dust burst or a cooking spike does not trigger it.
+  - id: alarm_above_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # Set by the print_screen script; the next display update also draws the page for the printer.
   - id: print_requested
     type: bool
@@ -539,71 +576,19 @@ number:
     optimistic: true    
     restore_value: true
 
-  # Buzzer alarm thresholds
+  # Buzzer alarm thresholds. Only CO2 and particulate matter have a health-based limit, so only they
+  # drive the buzzer; CH2O and TVOC are shown on the display but never sound the alarm (CH2O because the
+  # ZE08 drifts and reads a fixed offset, TVOC because it is a sum parameter without a limit).
+  # A limit must hold for 5 minutes before the alarm sounds (see the 10 s interval below).
   - platform: template
     name: "CO2 Alarm Threshold"
     id: co2_alarm_threshold
     entity_category: config
     unit_of_measurement: "ppm"
     icon: "mdi:molecule-co2"
-    initial_value: 1500
+    initial_value: 2000
     min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "CH2O Alarm Threshold"
-    id: ch2o_alarm_threshold
-    entity_category: config
-    icon: "mdi:gas-cylinder"
-    unit_of_measurement: "ppb"
-    initial_value: 200
-    min_value: 0
-    max_value: 1000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "TVOC Alarm Threshold (ENS160)"
-    id: tvoc_alarm_threshold_ens
-    entity_category: config
-    icon: "mdi:radiator"
-    unit_of_measurement: "ppb"
-    initial_value: 1400
-    min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "TVOC Alarm Threshold (SGP30)"
-    id: tvoc_alarm_threshold_sgp30
-    entity_category: config
-    icon: "mdi:radiator"
-    unit_of_measurement: "ppb"
-    initial_value: 1000
-    min_value: 0
-    max_value: 3000
-    step: 1
-    optimistic: true
-    restore_value: true
-    mode: BOX
-
-  - platform: template
-    name: "PM1 Alarm Threshold"
-    id: pm1_alarm_threshold
-    entity_category: config
-    unit_of_measurement: "µg/m³"
-    initial_value: 15
-    min_value: 0
-    max_value: 50
+    max_value: 5000
     step: 1
     optimistic: true
     restore_value: true
@@ -627,9 +612,9 @@ number:
     id: pm10_alarm_threshold
     entity_category: config
     unit_of_measurement: "µg/m³"
-    initial_value: 30
+    initial_value: 45
     min_value: 0
-    max_value: 100
+    max_value: 150
     step: 1
     optimistic: true
     restore_value: true
@@ -638,6 +623,10 @@ number:
   # Air filter control (script filter_control, air_filter.h): per value, fan speed 1 above the first number
   # and speed 6 above the second; speeds 2-5 lie in between ("Filter Steps" shows them). 0 turns the value off.
   # The higher speed of PM2.5 and TVOC wins.
+  # These are control settings, not health limits: the fan starts one colour step before the display warns
+  # (PM2.5 10 below the yellow 15, TVOC 800 = orange) and runs at full speed from the red / purple step on.
+  # Changing initial_value does NOT change a running box — the values are restored from flash, so set them
+  # once in the web UI (or via the number API).
   - platform: template
     name: "Filter Speed 1 above PM2.5 (0 = off)"
     id: filter_pm_start
@@ -647,7 +636,7 @@ number:
       sorting_group_id: web_group_filter
       sorting_weight: 11
     unit_of_measurement: "µg/m³"
-    initial_value: 5
+    initial_value: 10
     min_value: 0
     max_value: 200
     step: 1
@@ -674,7 +663,8 @@ number:
     mode: BOX
     on_value:
       - component.update: filter_steps
-  # ENS160 TVOC; defaults from the box's own logged data (75 % of hours below ~530 ppb, 90 % below ~920 ppb).
+  # ENS160 TVOC; = the display's orange step. TVOC has no absolute limit, so the band sits above the room's own
+  # baseline (75 % of hours below ~530 ppb) instead of starting the fan permanently.
   - platform: template
     name: "Filter Speed 1 above TVOC (0 = off)"
     id: filter_tvoc_start
@@ -684,7 +674,7 @@ number:
       sorting_group_id: web_group_filter
       sorting_weight: 13
     unit_of_measurement: "ppb"
-    initial_value: 500
+    initial_value: 800
     min_value: 0
     max_value: 10000
     step: 10
@@ -881,6 +871,45 @@ number:
     min_value: -30.0
     max_value: 30.0
     step: 0.1
+    restore_value: true
+    optimistic: true
+    initial_value: 0.0
+
+  # LTR390 window correction (datasheet: "WFAC", >1 for a tinted window in front of the sensor). This box
+  # runs the sensor without tinted glass, so it stays 1.0; raise it when the case gets a tinted cover. Applied
+  # as a multiplier on lux and UV index, exactly what the datasheet formula does.
+  - platform: template
+    name: "LTR390 Window Correction"
+    id: ltr_wfac
+    icon: "mdi:brightness-6"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 19
+    mode: BOX
+    min_value: 1.0
+    max_value: 4.0
+    step: 0.05
+    restore_value: true
+    optimistic: true
+    initial_value: 1.0
+
+  # Subtracted from the raw ZE08-CH2O reading. The datasheet has no accuracy figure and the protocol no
+  # zero-point command, so this is a relative calibration: zero it in fresh air with the button below (or
+  # enter a value by hand).
+  - platform: template
+    name: "CH2O Offset"
+    id: ch2o_offset
+    icon: "mdi:gas-cylinder"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 18
+    unit_of_measurement: "ppb"
+    mode: BOX
+    min_value: -200.0
+    max_value: 200.0
+    step: 1.0
     restore_value: true
     optimistic: true
     initial_value: 0.0
@@ -1403,13 +1432,19 @@ display:
       float abs_humidity = id(calculated_absolute_humidity).state;
       float altitude = id(calculated_altitude).state;
       auto light = id(ambient_light_ltr390).state;
-      col = id(white); if (co2 > 800){col = id(yellow);} if (co2 > 1200){col = id(orange);} if (co2 > 1500){col = id(red);} if (co2 > 1800){col = id(purple);} auto co2_c = col;
-      col = id(white); if (ch2o > 60){col = id(yellow);} if (ch2o > 100){col = id(orange);} if (ch2o > 150){col = id(red);} if (ch2o > 200){col = id(purple);} auto ch2o_c = col;
+      // Colour steps are anchored to published guideline values (see docs/sensor-capability-matrix.md):
+      // CO2 1000 ppm = UBA and ASR A3.6 "ventilate", 2000 ppm = ASR "not acceptable", 3000 ppm far above;
+      // PM2.5 / PM10 = WHO 2021 24 h guidelines and their interim targets, PM10 50 = EU daily limit;
+      // CH2O 80 ppb = 0.1 mg/m3 (WHO indoor air guidelines / UBA indoor value), 120 / 200 / 400 = 1.5x / 2.5x / 5x.
+      col = id(white); if (co2 > 1000){col = id(yellow);} if (co2 > 1500){col = id(orange);} if (co2 > 2000){col = id(red);} if (co2 > 3000){col = id(purple);} auto co2_c = col;
+      col = id(white); if (ch2o > 80){col = id(yellow);} if (ch2o > 120){col = id(orange);} if (ch2o > 200){col = id(red);} if (ch2o > 400){col = id(purple);} auto ch2o_c = col;
+      // TVOC is a sum parameter without a health-based limit; these are the room's own trend bands.
       col = id(white); if (e_voc > 400){col = id(yellow);} if (e_voc > 800){col = id(orange);} if (e_voc > 1400){col = id(red);} if (e_voc > 2000){col = id(purple);} auto e_voc_c = col;
       col = id(white); if (sgp30 > 400){col = id(yellow);} if (sgp30 > 800){col = id(orange);} if (sgp30 > 1400){col = id(red);} if (sgp30 > 2000){col = id(purple);} auto sgp30_c = col;
-      col = id(white); if (pm1 > 5){col = id(yellow);} if (pm1 > 10){col = id(orange);} if (pm1 > 15){col = id(red);} if (pm1 > 25){col = id(purple);} auto pm1_c = col;
-      col = id(white); if (pm25 > 5){col = id(yellow);} if (pm25 > 10){col = id(orange);} if (pm25 > 15){col = id(red);} if (pm25 > 25){col = id(purple);} auto pm25_c = col;
-      col = id(white); if (pm10 > 15){col = id(yellow);} if (pm10 > 45){col = id(orange);} if (pm10 > 60){col = id(red);} if (pm10 > 80){col = id(purple);} auto pm10_c = col;
+      // No guideline exists for PM1, so it stays neutral instead of colouring at 5 µg/m³.
+      auto pm1_c = id(white);
+      col = id(white); if (pm25 > 15){col = id(yellow);} if (pm25 > 25){col = id(orange);} if (pm25 > 50){col = id(red);} if (pm25 > 75){col = id(purple);} auto pm25_c = col;
+      col = id(white); if (pm10 > 45){col = id(yellow);} if (pm10 > 50){col = id(orange);} if (pm10 > 75){col = id(red);} if (pm10 > 100){col = id(purple);} auto pm10_c = col;
       col = id(white);
       if (!isnan(light)) {
         if (light < 50){col = id(grey);}
@@ -1713,16 +1748,10 @@ display:
          cy_info += fl18->get_height() + 3;
          it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CO2 > %.0f ppm", id(co2_alarm_threshold).state);
          cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- CH2O > %.0f ppb", id(ch2o_alarm_threshold).state);
+         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- PM2.5 / PM10 > %.0f / %.0f µg/m³", id(pm25_alarm_threshold).state,
+                   id(pm10_alarm_threshold).state);
          cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC ENS160 > %.0f ppb", id(tvoc_alarm_threshold_ens).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- TVOC SGP30 > %.0f ppb", id(tvoc_alarm_threshold_sgp30).state);
-         cy_info += fl14->get_height() + 1;
-         it.printf(10, cy_info, fl14, id(white), TextAlign::TOP_LEFT, "- PM1/2.5/10 > %.0f/%.0f/%.0f µg/m³", id(pm1_alarm_threshold).state,
-                   id(pm25_alarm_threshold).state, id(pm10_alarm_threshold).state);
-         cy_info += fl14->get_height() + 1;
-         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "only with Buzzer Alarm on");
+         it.print(10, cy_info, fl14, id(grey), TextAlign::TOP_LEFT, "after 5 min, only with Buzzer Alarm on");
          cy_info += fl14->get_height() + 5;
          it.print(w/2, cy_info, fl18, id(light_grey), TextAlign::TOP_CENTER, "Pages and Controls");
          cy_info += fl18->get_height() + 3;
@@ -2026,6 +2055,11 @@ sensor:
     icon: "mdi:gas-cylinder"
     filters: 
       - filter_out: 2000.0
+      # The ZE08 datasheet specifies no accuracy at all (only a resolution of ≤0.01 ppm), its protocol has no
+      # zero-point command, and the manufacturer warns that the zero drifts after long exposure to organic
+      # gases. The reading is therefore only a relative value: "CH2O Offset" is subtracted here (like the
+      # temperature offsets) and is set in fresh air with the "Zero CH2O (fresh air)" button.
+      - offset: !lambda return -id(ch2o_offset).state;
       - exponential_moving_average:
           send_every: 30
           alpha: 0.5
@@ -2176,11 +2210,11 @@ sensor:
     accuracy_decimals: 0
     update_interval: 10s
     lambda: |-
-      if (id(sgp30_baseline_saved)) return 0;
-      // After 12 h of continuous operation the baseline is learned and store_baseline keeps it in flash.
-      if (id(tvoc_sgp30).has_state() && esp_timer_get_time() >= 12LL * 3600LL * 1000000LL) {
+      // Counts the current uptime window, not a stored flag: ESPHome restarts the 12 h on every boot and
+      // only writes the baseline to flash after a full window. 0 = window complete.
+      if (!id(sgp30_baseline_saved) && id(tvoc_sgp30).has_state() &&
+          esp_timer_get_time() >= 12LL * 3600LL * 1000000LL) {
         id(sgp30_baseline_saved) = true;
-        return 0;
       }
       int64_t elapsed_min = esp_timer_get_time() / 60000000LL;
       if (elapsed_min >= 720) return 0;
@@ -2396,15 +2430,25 @@ sensor:
       name: "LTR390 UV Index"
       id: uv_index_ltr390
       icon: "mdi:sun-wireless-outline"
+      # The datasheet's 2300 counts/UVI only hold for gain X18 at 20 bit; ESPHome scales other combinations
+      # linearly. Applied here as a multiplier, which is what the datasheet's WFAC does to lux and UVI alike.
+      filters:
+        - multiply: !lambda return id(ltr_wfac).state;
     light:
       name: "LTR390 Ambient Light"
       icon: "mdi:weather-sunny"
       id: ambient_light_ltr390
+      filters:
+        - multiply: !lambda return id(ltr_wfac).state;
       on_value:
         then:
           - script.execute: adjust_backlight_based_on_light
-    gain: X3
-    resolution: 18   
+    gain:
+      ambient_light: X3
+      uv: X18
+    resolution:
+      ambient_light: 18
+      uv: 20
     update_interval: 11s
 
   # All outputs follow the hub's ULP rate (every 5 min). Per-sensor LP with a ULP hub fails at setup:
@@ -2618,6 +2662,37 @@ button:
       sorting_weight: 4
     on_press:
       - lambda: sdlog::request_unmount();
+  # Air filter: the four speed limits back to their defaults (10 / 50 µg/m³ PM2.5, 800 / 2000 ppb TVOC).
+  # Needed because the numbers are restored from flash: a changed default in this file only reaches a box
+  # that has never stored a value. The speeds are also re-evaluated right away instead of on the next 30 s tick.
+  - platform: template
+    name: "Filter Thresholds Reset"
+    id: filter_thresholds_reset
+    icon: "mdi:backup-restore"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_filter
+      sorting_weight: 15
+    on_press:
+      - number.set:
+          id: filter_pm_start
+          value: 10
+      - number.set:
+          id: filter_pm_full
+          value: 50
+      - number.set:
+          id: filter_tvoc_start
+          value: 800
+      - number.set:
+          id: filter_tvoc_full
+          value: 2000
+      - lambda: |-
+          // -1 makes airfilter::speed_for() recompute the level from scratch instead of keeping the
+          // hysteresis state of the old thresholds.
+          id(filter_speed_pm) = -1;
+          id(filter_speed_tvoc) = -1;
+      - script.execute: filter_control
+      - component.update: filter_steps
   # Calibration: set every temperature or humidity offset from the "Reference ..." value (script calibrate_offsets).
   - platform: template
     name: "Calibrate Temperature"
@@ -2641,6 +2716,22 @@ button:
       - script.execute:
           id: calibrate_offsets
           humidity: true
+  # ZE08-CH2O zero point: the sensor has a fixed offset that drifts. Run the box in fresh air for a few
+  # minutes, then press this to subtract the current reading, so display, colour steps and log start at 0.
+  - platform: template
+    name: "Zero CH2O (fresh air)"
+    icon: "mdi:gas-cylinder"
+    entity_category: config
+    web_server:
+      sorting_group_id: web_group_calibration
+      sorting_weight: 7
+    on_press:
+      - lambda: |-
+          float corrected = id(ch2o_ze08).state;
+          if (std::isnan(corrected))
+            return;
+          // corrected = raw - offset, so adding the corrected reading to the offset makes the next one 0.
+          id(ch2o_offset).make_call().set_value(id(ch2o_offset).state + corrected).perform();
   # SCD40 CO2: forced recalibration against fresh air. Sensirion requires running the sensor in the mode used
   # later for more than 3 minutes in fresh air (~400-450 ppm) before this; 420 ppm is the current global
   # monthly mean. Automatic self calibration stays enabled.
@@ -2774,16 +2865,25 @@ interval:
       - if:
           condition:
             lambda: |-
-              return (id(buzzer_alarm_enabled) &&
-                      (
-                        (id(co2_scd40).state > id(co2_alarm_threshold).state) ||
-                        (id(ch2o_ze08).state > id(ch2o_alarm_threshold).state) ||
-                        (id(tvoc_ens160).state > id(tvoc_alarm_threshold_ens).state) ||
-                        (id(tvoc_sgp30).state > id(tvoc_alarm_threshold_sgp30).state) ||
-                        (id(pm1_pms).state > id(pm1_alarm_threshold).state) ||
-                        (id(pm25_pms).state > id(pm25_alarm_threshold).state) ||
-                        (id(pm10_pms).state > id(pm10_alarm_threshold).state)
-                      ));
+              static const uint32_t ALARM_DELAY_MS = 5UL * 60UL * 1000UL;
+              if (!id(buzzer_alarm_enabled)) {
+                id(alarm_above_since) = 0;
+                return false;
+              }
+              // Only CO2, PM2.5 and PM10 have a health-based limit; CH2O and TVOC stay on the display only.
+              bool above = (id(co2_scd40).state > id(co2_alarm_threshold).state) ||
+                           (id(pm25_pms).state > id(pm25_alarm_threshold).state) ||
+                           (id(pm10_pms).state > id(pm10_alarm_threshold).state);
+              if (!above) {
+                id(alarm_above_since) = 0;
+                return false;
+              }
+              uint32_t now = millis();
+              if (id(alarm_above_since) == 0) {
+                id(alarm_above_since) = now == 0 ? 1 : now;
+                return false;
+              }
+              return (uint32_t) (now - id(alarm_above_since)) >= ALARM_DELAY_MS;
           then:
             - switch.turn_on: buzzer_switch
             - delay: 1s
