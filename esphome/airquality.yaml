@@ -308,6 +308,36 @@ text_sensor:
       }
       return std::string(buf);
 
+  # NWS heat index classes in Celsius (27/33/42/54 are the 80/90/105/130 F steps).
+  - platform: template
+    name: "Heat Index Rating"
+    id: heat_index_rating
+    icon: "mdi:thermometer-alert"
+    update_interval: 60s
+    lambda: |-
+      float hi = id(heat_index).state;
+      if (isnan(hi)) return {"Unknown"};
+      if (hi < 27.0f) return {"No risk"};
+      if (hi < 33.0f) return {"Caution"};
+      if (hi < 42.0f) return {"Extreme caution"};
+      if (hi < 54.0f) return {"Danger"};
+      return {"Extreme danger"};
+
+  # Mould risk classes: 70 % starts critical surface humidity for mould, 80 % keeps the
+  # surface wet for hours.
+  - platform: template
+    name: "Mold Risk Rating"
+    id: mold_risk_rating
+    icon: "mdi:molecule"
+    update_interval: 60s
+    lambda: |-
+      float risk = id(mold_risk).state;
+      if (isnan(risk)) return {"Unknown"};
+      if (risk < 60.0f) return {"Low"};
+      if (risk < 70.0f) return {"Elevated"};
+      if (risk < 80.0f) return {"High"};
+      return {"Very high"};
+
 # QR Code generator
 qr_code:
   - id: webserver_qr
@@ -1487,7 +1517,7 @@ display:
       uint32_t global_current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
       if (current_main_display_mode == 0) {
         if (global_current_time_ms - id(last_top_toggle_time) >= 10000) {
-          id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 5;
+          id(top_display_mode_toggle) = (id(top_display_mode_toggle) + 1) % 6;
           id(last_top_toggle_time) = global_current_time_ms;
         }
       } else {
@@ -1626,6 +1656,34 @@ display:
               it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, iaq_c, display::TextAlign::BOTTOM_RIGHT, "%.0f", iaq);
           } else {
               it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else if (current_top_display_mode == 5) {
+          // Heat index and mould risk both describe how close the room is to uncomfortable
+          // or harmful conditions, so they share one view.
+          float hi = id(heat_index).state;
+          esphome::Color hi_c = id(white);
+          if (hi >= 54) { hi_c = id(purple); }
+          else if (hi >= 42) { hi_c = id(red); }
+          else if (hi >= 33) { hi_c = id(orange); }
+          else if (hi >= 27) { hi_c = id(yellow); }
+          it.print(left_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Heat idx");
+          it.print(left_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
+          if (!isnan(hi)) {
+            it.printf(left_col_x, 34 + temp_hum_display_offset_y, fv30, hi_c, display::TextAlign::BOTTOM_RIGHT, "%.1f", hi);
+          } else {
+            it.print(left_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
+          }
+          float risk = id(mold_risk).state;
+          esphome::Color risk_c = id(white);
+          if (risk >= 80) { risk_c = id(red); }
+          else if (risk >= 70) { risk_c = id(orange); }
+          else if (risk >= 60) { risk_c = id(yellow); }
+          it.print(right_col_x, 18 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Mold");
+          it.print(right_col_x, 30 + temp_hum_display_offset_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%");
+          if (!isnan(risk)) {
+            it.printf(right_col_x, 34 + temp_hum_display_offset_y, fv30, risk_c, display::TextAlign::BOTTOM_RIGHT, "%.0f", risk);
+          } else {
+            it.print(right_col_x, 34 + temp_hum_display_offset_y, fv30, id(grey), display::TextAlign::BOTTOM_RIGHT, "--");
           }
         }
         auto cy_main = top_section_height + padding_after_top;
@@ -1929,8 +1987,8 @@ display:
       int total_pages = 8;
       if (current_main_display_mode == 0) {
         uint32_t current_time_ms = (uint32_t) (esp_timer_get_time() / 1000);
-        if (current_time_ms - id(last_bottom_toggle_time) >= 10000) {
-          id(display_mode_toggle) = 1 - id(display_mode_toggle);
+        if (current_time_ms - id(last_bottom_toggle_time) >= 8000) {
+          id(display_mode_toggle) = (id(display_mode_toggle) + 1) % 4;
           id(last_bottom_toggle_time) = current_time_ms;
         }
         int current_display_mode_bottom = id(display_mode_toggle);
@@ -1940,12 +1998,43 @@ display:
             it.strftime(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "%d.%m.%Y", now);
             it.strftime(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, "%H:%M", now);
           }
-        } else {
+        } else if (current_display_mode_bottom == 1) {
           auto current_ip = wifi::global_wifi_component->wifi_sta_ip_addresses()[0];
           char ip_str[40];
           current_ip.str_to(ip_str);
           it.print(10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, App.get_name().c_str());
           it.print(w - 10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_RIGHT, ip_str);
+        } else if (current_display_mode_bottom == 2) {
+          // Heat index with its NWS class, colored like the top row.
+          float hi = id(heat_index).state;
+          esphome::Color hi_c = id(white);
+          if (hi >= 54) { hi_c = id(purple); }
+          else if (hi >= 42) { hi_c = id(red); }
+          else if (hi >= 33) { hi_c = id(orange); }
+          else if (hi >= 27) { hi_c = id(yellow); }
+          it.print(10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Heat index");
+          if (!isnan(hi)) {
+            char hi_txt[48];
+            snprintf(hi_txt, sizeof(hi_txt), "%.1f °C  %s", hi, id(heat_index_rating).state.c_str());
+            it.print(w - 10, text_baseline_y, fl14, hi_c, TextAlign::BOTTOM_RIGHT, hi_txt);
+          } else {
+            it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "--");
+          }
+        } else {
+          // Mould risk in percent with its class.
+          float risk = id(mold_risk).state;
+          esphome::Color risk_c = id(white);
+          if (risk >= 80) { risk_c = id(red); }
+          else if (risk >= 70) { risk_c = id(orange); }
+          else if (risk >= 60) { risk_c = id(yellow); }
+          it.print(10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_LEFT, "Mold risk");
+          if (!isnan(risk)) {
+            char risk_txt[48];
+            snprintf(risk_txt, sizeof(risk_txt), "%.0f %%  %s", risk, id(mold_risk_rating).state.c_str());
+            it.print(w - 10, text_baseline_y, fl14, risk_c, TextAlign::BOTTOM_RIGHT, risk_txt);
+          } else {
+            it.print(w - 10, text_baseline_y, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "--");
+          }
         }
       } else if (current_main_display_mode == 1) {
           it.print(10, text_baseline_y, fl14, id(white), TextAlign::BOTTOM_LEFT, "VCPM");
@@ -2185,6 +2274,91 @@ sensor:
       float abs_humidity = 216.7 * avp / (273.15 + t);
       return abs_humidity;
 
+  # Heat index per NWS: the formula works in Fahrenheit internally, the result goes back to
+  # Celsius. Source order matches Calculated Absolute Humidity.
+  - platform: template
+    name: "Heat Index"
+    id: heat_index
+    icon: "mdi:thermometer-alert"
+    unit_of_measurement: "°C"
+    state_class: measurement
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      float t = NAN;
+      float rh = NAN;
+      if (!isnan(id(temp_bme680).state) && !isnan(id(hum_bme680).state)) {
+        t = id(temp_bme680).state;
+        rh = id(hum_bme680).state;
+      }
+      else if (!isnan(id(temp_sht41).state) && !isnan(id(hum_sht41).state)) {
+        t = id(temp_sht41).state;
+        rh = id(hum_sht41).state;
+      }
+      else {
+        float temps[2] = {id(temp_scd40).state, id(temp_aht21_ens).state};
+        float hums[2] = {id(hum_scd40).state, id(hum_aht21_ens).state};
+        for (int i = 0; i < 2; i++) {
+          if (!isnan(temps[i]) && !isnan(hums[i])) {
+            t = temps[i];
+            rh = hums[i];
+            break;
+          }
+        }
+      }
+      if (isnan(t) || isnan(rh) || rh < 0 || rh > 100)
+        return NAN;
+      float tf = t * 9.0f / 5.0f + 32.0f;
+      float hi = 0.5f * (tf + 61.0f + ((tf - 68.0f) * 1.2f) + (rh * 0.094f));
+      if (hi >= 80.0f) {
+        hi = -42.379f + 2.04901523f * tf + 10.14333127f * rh - 0.22475541f * tf * rh
+             - 0.00683783f * tf * tf - 0.05481717f * rh * rh
+             + 0.00122874f * tf * tf * rh + 0.00085282f * tf * rh * rh
+             - 0.00000199f * tf * tf * rh * rh;
+      }
+      return (hi - 32.0f) * 5.0f / 9.0f;
+
+  # Mould risk as dew point over air temperature in percent: how much of the room
+  # temperature a surface may lose before water condenses on it. Around 70 the film lasts
+  # long enough for mould growth, above 80 it stays wet.
+  - platform: template
+    name: "Mold Risk"
+    id: mold_risk
+    icon: "mdi:molecule"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      float t = NAN;
+      float rh = NAN;
+      if (!isnan(id(temp_bme680).state) && !isnan(id(hum_bme680).state)) {
+        t = id(temp_bme680).state;
+        rh = id(hum_bme680).state;
+      }
+      else if (!isnan(id(temp_sht41).state) && !isnan(id(hum_sht41).state)) {
+        t = id(temp_sht41).state;
+        rh = id(hum_sht41).state;
+      }
+      else {
+        float temps[2] = {id(temp_scd40).state, id(temp_aht21_ens).state};
+        float hums[2] = {id(hum_scd40).state, id(hum_aht21_ens).state};
+        for (int i = 0; i < 2; i++) {
+          if (!isnan(temps[i]) && !isnan(hums[i])) {
+            t = temps[i];
+            rh = hums[i];
+            break;
+          }
+        }
+      }
+      if (isnan(t) || isnan(rh) || rh <= 0 || rh > 100 || t <= -40.0f || t >= 85.0f)
+        return NAN;
+      float a = 17.27f;
+      float b = 237.7f;
+      float alpha = ((a * t) / (b + t)) + log(rh / 100.0f);
+      float dew = (b * alpha) / (a - alpha);
+      return (dew / t) * 100.0f;
+
   # Select best sensor
   - platform: template
     name: "Best Temperature"
@@ -2292,6 +2466,10 @@ sensor:
       
   # Debug Sensors
   - platform: debug
+    fragmentation:
+      name: "Heap Fragmentation"
+      id: fragmentation
+      disabled_by_default: false
     free:
       name: "Heap Free (Bytes)"
       id: heap_free
@@ -2871,7 +3049,7 @@ interval:
               "time,bme680_t,bme680_rh,bme680_p,bme680_gas,bme680_iaq,bme680_iaq_acc,bme680_iaq_static,"
               "bme680_co2eq,bme680_bvoc,scd40_co2,scd40_t,scd40_rh,sgp30_eco2,sgp30_tvoc,"
               "ens160_eco2,ens160_tvoc,ens160_aqi,ze08_ch2o,pm1,pm25,pm10,lux,uvi,"
-              "sht41_t,sht41_rh,aht21_t,aht21_rh,dew_bme680,dew_sht41,abs_hum";
+              "sht41_t,sht41_rh,aht21_t,aht21_rh,dew_bme680,dew_sht41,abs_hum,heat_index,mold_risk";
           char date[16];
           now.strftime(date, sizeof(date), "%Y%m%d");
           sdlog::Row row;
@@ -2907,6 +3085,8 @@ interval:
           row.num(id(dew_point_bme680).state, 2);
           row.num(id(dew_point_sensor).state, 2);
           row.num(id(calculated_absolute_humidity).state, 2);
+          row.num(id(heat_index).state, 1);
+          row.num(id(mold_risk).state, 0);
           sdlog::log_row(date, header, row);
 
   # SD card: retry mounting every 10 min while no card is mounted (card inserted later, or pulled
