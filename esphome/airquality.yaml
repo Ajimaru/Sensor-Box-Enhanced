@@ -69,7 +69,7 @@ psram:
 
 # Logging
 logger:
-  level: DEBUG
+  level: INFO
 
 # Home Assistant API and failsafe mechanisms
 api:
@@ -104,23 +104,24 @@ web_server:
     type: digest
     username: !secret web_server_username
     password: !secret web_server_password
-  # Own section at the top for the SD card entities (otherwise split into "Configuration"/"Diagnostic").
+  # Own sections between "Sensor and Control" (0) and "Configuration" (1); "Diagnostic" (2) and the
+  # OTA card stay below. Without a weight they would default to 50 and land after Diagnostics.
   sorting_groups:
     - id: web_group_sd_card
       name: "SD Card"
-      sorting_weight: -10
+      sorting_weight: 0.5
     - id: web_group_printer
       name: "Printer"
-      sorting_weight: -9
+      sorting_weight: 0.6
     - id: web_group_backlight
       name: "Display Backlight"
-      sorting_weight: -8
+      sorting_weight: 0.7
     - id: web_group_filter
       name: "Air Filter"
-      sorting_weight: -7
+      sorting_weight: 0.8
     - id: web_group_calibration
       name: "Calibration"
-      sorting_weight: -6
+      sorting_weight: 0.9
 
 # Debug
 debug:
@@ -1483,8 +1484,8 @@ display:
       auto pm1 = id(pm1_pms).state;
       auto pm25 = id(pm25_pms).state;
       auto pm10 = id(pm10_pms).state;
-      auto aqi_voc = id(aqi_voc_sgp41).state;
-      auto aqi_nox = id(aqi_nox_sgp41).state;
+      auto aqi_voc = NAN;
+      auto aqi_nox = NAN;
       auto ens160_aqi = id(aqi_ens160).state;
       float pressure = id(pres_bme680).state;
       float dew_point = id(dew_point_bme680).state;
@@ -2202,7 +2203,9 @@ sensor:
     name: "ZE08 CH2O"
     unit_of_measurement: ppb
     state_class: measurement
-    device_class: volatile_organic_compounds
+    # No device_class: HA accepts only mg/m³ and µg/m³ for "volatile_organic_compounds", and the whole
+    # chain here is calibrated in ppb (thresholds 80/120/200/400, the offset, the display colours), so
+    # converting to µg/m³ would move every value by the factor 1.228.
     id: ch2o_ze08
     icon: "mdi:gas-cylinder"
     filters: 
@@ -2664,34 +2667,34 @@ sensor:
       humidity_source: hum_sht41
       temperature_source: temp_sht41
 
-  # Not populated in this box: there is no SGP41 at 0x59, so setup logs "Get serial number failed" and the
-  # component is marked FAILED on every boot; both entities stay unavailable. The block is kept for a later
-  # upgrade — comment it out if the chip won't be fitted.
-  - platform: sgp4x
-    i2c_id: i2c_1
-    #address: 0x59
-    voc_index:
-      name: "SGP41 VOC Index"
-      id: aqi_voc_sgp41
-      disabled_by_default: True
-      icon: "mdi:radiator"
-      device_class: aqi
-      state_class: measurement
-      unit_of_measurement: "index points"
-    nox_index:
-      name: "SGP41 NOx Index"
-      id: aqi_nox_sgp41
-      disabled_by_default: True
-      icon: "mdi:radiator"
-      device_class: aqi
-      state_class: measurement
-      unit_of_measurement: "index points"
-    # SHT41: the most accurate temperature/humidity sensor in the box.
-    compensation:
-      humidity_source: hum_sht41
-      temperature_source: temp_sht41
-    store_baseline: True
-    update_interval: 41s
+  # Not populated in this box: there is no SGP41 at 0x59, so setup logged "Get serial number failed" and the
+  # component was marked FAILED on every boot; both entities stayed unavailable. Commented out until a chip
+  # is fitted. The display reads via the local aqi_voc / aqi_nox variables (NAN = not fitted).
+  #-  platform: sgp4x
+  #  i2c_id: i2c_1
+  #  #address: 0x59
+  #  voc_index:
+  #    name: "SGP41 VOC Index"
+  #    id: aqi_voc_sgp41
+  #    disabled_by_default: True
+  #    icon: "mdi:radiator"
+  #    device_class: aqi
+  #    state_class: measurement
+  #    unit_of_measurement: "index points"
+  #  nox_index:
+  #    name: "SGP41 NOx Index"
+  #    id: aqi_nox_sgp41
+  #    disabled_by_default: True
+  #    icon: "mdi:radiator"
+  #    device_class: aqi
+  #    state_class: measurement
+  #    unit_of_measurement: "index points"
+  #  # SHT41: the most accurate temperature/humidity sensor in the box.
+  #  compensation:
+  #    humidity_source: hum_sht41
+  #    temperature_source: temp_sht41
+  #  store_baseline: True
+  #  update_interval: 41s
 
   - platform: ltr390
     id: uv_light_ltr390
