@@ -8,7 +8,7 @@ substitutions:
   friendly_name: Airquality
   # Single source for the firmware version: the project block (reported to Home Assistant and checked against
   # the release tag) and the info page footer both use it.
-  version: "0.1.1"
+  version: "0.1.2"
   # QR204 thermal printer bridge (separate project): raw ESC/POS over TCP. The host is set in the web UI
   # ("Printer Host", text entity printer_host).
   printer_port: "9100"
@@ -81,6 +81,7 @@ api:
 # Over-The-Air updates
 ota:
   - platform: esphome
+    encryption:
 
 # provisioning Wi-Fi via serial
 improv_serial:
@@ -186,8 +187,22 @@ text_sensor:
   - platform: debug
     device:
       name: "Device Info"
+      icon: "mdi:information-outline"
     reset_reason:
       name: "Reset Reason"
+      icon: "mdi:restart-alert"
+
+  # 5. WiFi
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "Connected SSID"
+      icon: "mdi:wifi"
+    mac_address:
+      name: "MAC Address"
+      icon: "mdi:identifier"
 
   - platform: template
     name: "BME680 IAQ Classification"
@@ -2464,32 +2479,58 @@ sensor:
       if (elapsed_min >= 720) return 0;
       return 720 - (int) elapsed_min;
       
-  # Debug Sensors
+  # --- Diagnostics -------------------------------------------------------------
+  # Identical entities, icons and order on every ESPHome device of this house.
   - platform: debug
+    # CPU
+    cpu_frequency:
+      name: "CPU Frequency"
+      id: cpu_frequency
+      icon: "mdi:cpu-32-bit"
+      disabled_by_default: True
+    # Heap / RAM / PSRAM
     fragmentation:
       name: "Heap Fragmentation"
       id: fragmentation
+      icon: "mdi:puzzle"
       disabled_by_default: false
     free:
       name: "Heap Free (Bytes)"
       id: heap_free
+      icon: "mdi:memory"
       disabled_by_default: True
     block:
       name: "Heap Max Block (Bytes)"
       id: heap_block
+      icon: "mdi:memory"
       disabled_by_default: True
     psram:
       name: "PSRAM Free (Bytes)"
       id: free_psram
+      icon: "mdi:memory"
       disabled_by_default: True
+    # Loop time
     loop_time:
       name: "Loop Time"
       id: loop_time
+      icon: "mdi:timer-outline"
       disabled_by_default: False
-    cpu_frequency:
-      name: "CPU Frequency"
-      id: cpu_frequency
-      disabled_by_default: True
+
+  - platform: template
+    name: "CPU Frequency MHz"
+    id: cpu_mhz
+    icon: "mdi:cpu-32-bit"
+    entity_category: diagnostic
+    unit_of_measurement: "MHz"
+    update_interval: 66s
+    lambda: |-
+      if (!id(cpu_frequency).has_state()) return {NAN};
+      float freq = id(cpu_frequency).state;
+      if (freq > 0) {
+        return {static_cast<float>(round(freq / 1000000 * 100) / 100)};
+      } else {
+        return {NAN};
+      }
 
   - platform: template
     name: "Heap Free (KB)"
@@ -2548,24 +2589,6 @@ sensor:
     entity_category: diagnostic
     icon: "mdi:wifi"
     update_interval: 60s
-
-  - platform: template
-    name: "CPU Frequency MHz"
-    icon: "mdi:cpu-32-bit"
-    entity_category: diagnostic
-    unit_of_measurement: "MHz"
-    lambda: |-
-      if (id(cpu_frequency).has_state()) {
-        float freq = id(cpu_frequency).state;
-        if (freq > 0) {
-          return {static_cast<float>(round(freq / 1000000 * 100) / 100)};
-        } else {
-          return {NAN};
-        }
-      } else {
-        return {NAN};
-      }
-    update_interval: 66s
 
   # I2C 1 Bus
   - platform: sht4x
@@ -2879,6 +2902,7 @@ switch:
 
   - platform: restart
     name: ${name} restart
+    icon: "mdi:restart"
     entity_category: diagnostic
 
 # Buttons
@@ -2886,10 +2910,12 @@ button:
   # Factory Reset
   - platform: factory_reset
     name: "Factory Reset"
+    icon: "mdi:backup-restore"
     entity_category: diagnostic
   # Save Mode
   - platform: safe_mode
     name: "Safe Mode"
+    icon: "mdi:lifebuoy"
     entity_category: diagnostic
   # SD card (sd_logger.h): unmount before pulling the card (wait for "Not mounted (safe to remove)"; the
   # sdlog task handles the request after a row in progress), mount after inserting it.
