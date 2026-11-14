@@ -2404,7 +2404,7 @@ sensor:
     id: qnh
     unit_of_measurement: "hPa"
     state_class: "measurement"
-    icon: "mdi:gauge"
+    icon: "mdi:mountain"
     update_interval: 60s
     lambda: |-
       float local_pressure = id(pres_bme680).state;
